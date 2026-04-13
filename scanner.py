@@ -13,6 +13,7 @@ import pandas as pd
 import yfinance as yf
 import json
 import os
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -227,35 +228,68 @@ def beregn_rsi(serie: pd.Series, periode: int = 14) -> pd.Series:
 @st.cache_data(ttl=300, show_spinner=False)
 def hent_data(ticker_dict: dict, dager_historikk: int = 250) -> pd.DataFrame:
     """
-    Henter kursdata fra yfinance og beregner alle indikatorer.
-    Returnerer én rad per aksje.
+    Henter kursdata fra yfinance i batch (unngår rate limiting).
+    Returnerer én rad per aksje med alle indikatorer.
     """
-    resultater = []
     tickers_liste = list(ticker_dict.keys())
-
     start = datetime.now() - timedelta(days=dager_historikk + 50)
     end = datetime.now()
 
+    # Last ned alle tickers i batches à 40 stk for å unngå rate limit
+    BATCH_SIZE = 40
+    alle_data = {}
     progress = st.progress(0, text="Henter data...")
-    total = len(tickers_liste)
 
-    for idx, ticker in enumerate(tickers_liste):
-        progress.progress((idx + 1) / total, text=f"Henter {ticker} ({idx+1}/{total})...")
+    for batch_nr in range(0, len(tickers_liste), BATCH_SIZE):
+        batch = tickers_liste[batch_nr:batch_nr + BATCH_SIZE]
+        batch_label = f"Batch {batch_nr // BATCH_SIZE + 1}/{(len(tickers_liste) - 1) // BATCH_SIZE + 1}"
+        progress.progress(
+            min((batch_nr + BATCH_SIZE) / len(tickers_liste), 1.0),
+            text=f"Henter {batch_label} ({min(batch_nr + BATCH_SIZE, len(tickers_liste))}/{len(tickers_liste)} aksjer)..."
+        )
         try:
-            df = yf.download(
-                ticker, start=start, end=end,
-                progress=False, auto_adjust=True, timeout=15
+            raw = yf.download(
+                batch, start=start, end=end,
+                progress=False, auto_adjust=True, timeout=30,
+                group_by="ticker", threads=True
             )
-            if df is None or df.empty or len(df) < 50:
-                continue
+            if raw is not None and not raw.empty:
+                for ticker in batch:
+                    try:
+                        if len(batch) == 1:
+                            # Enkel ticker: kolonner er bare Close, Volume etc.
+                            df_t = raw.copy()
+                        else:
+                            # Multi-ticker: kolonner er (Ticker, Price)
+                            df_t = raw[ticker].copy()
+                        df_t = df_t.dropna(how="all")
+                        if len(df_t) >= 50:
+                            alle_data[ticker] = df_t
+                    except (KeyError, TypeError):
+                        continue
+        except Exception as e:
+            print(f"⚠️  Batch-feil: {e}")
 
+        # Liten pause mellom batches
+        if batch_nr + BATCH_SIZE < len(tickers_liste):
+            time.sleep(2)
+
+    progress.empty()
+
+    # Beregn indikatorer for hver aksje
+    resultater = []
+    for ticker, df in alle_data.items():
+        try:
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
 
-            close = df["Close"]
-            volume = df["Volume"]
-            high = df["High"]
-            low = df["Low"]
+            close = df["Close"].dropna()
+            volume = df["Volume"].dropna()
+            high = df["High"].dropna()
+            low = df["Low"].dropna()
+
+            if len(close) < 50:
+                continue
 
             siste_kurs = float(close.iloc[-1])
             forrige_kurs = float(close.iloc[-2]) if len(close) >= 2 else siste_kurs
@@ -299,10 +333,8 @@ def hent_data(ticker_dict: dict, dager_historikk: int = 250) -> pd.DataFrame:
                 "Avst 20d Low %": avstand_low_20d_pct,
             })
         except Exception as e:
-            print(f"⚠️  Feil ved henting av {ticker}: {e}")
+            print(f"⚠️  Feil ved beregning for {ticker}: {e}")
             continue
-
-    progress.empty()
 
     if not resultater:
         return pd.DataFrame()
