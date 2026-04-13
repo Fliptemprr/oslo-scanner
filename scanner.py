@@ -26,7 +26,7 @@ WATCHLIST_FILE = Path("watchlist.json")
 # [FIX #5] Default likviditet økt — 50k var altfor lavt for reell trading
 DEFAULT_MIN_AVG_VOLUME = 200_000
 
-BATCH_SIZE = 20
+BATCH_SIZE = 15
 BATCH_DELAY = 5
 
 # ──────────────────────────────────────────────────────────────
@@ -213,7 +213,7 @@ def hent_data(ticker_dict: dict, dager_historikk: int = 250) -> pd.DataFrame:
                 raw = yf.download(
                     batch, start=start, end=end,
                     progress=False, auto_adjust=True,
-                    timeout=30, group_by="ticker", threads=True,
+                    timeout=30, group_by="ticker", threads=False,
                     session=session
                 )
                 if raw is not None and not raw.empty:
@@ -234,6 +234,28 @@ def hent_data(ticker_dict: dict, dager_historikk: int = 250) -> pd.DataFrame:
 
         if batch_nr + BATCH_SIZE < len(tickers_liste):
             time.sleep(BATCH_DELAY)
+
+    # Retry-pass: hent manglende tickers én og én
+    mangler = [t for t in tickers_liste if t not in alle_data]
+    if mangler:
+        progress.progress(0.95, text=f"Retry {len(mangler)} manglende aksjer...")
+        time.sleep(BATCH_DELAY)
+        for ticker in mangler:
+            try:
+                raw = yf.download(
+                    ticker, start=start, end=end,
+                    progress=False, auto_adjust=True,
+                    timeout=20, session=session
+                )
+                if raw is not None and not raw.empty:
+                    if isinstance(raw.columns, pd.MultiIndex):
+                        raw.columns = raw.columns.get_level_values(0)
+                    raw = raw.dropna(how="all")
+                    if len(raw) >= 50:
+                        alle_data[ticker] = raw
+                time.sleep(2)
+            except Exception:
+                continue
 
     progress.empty()
 
