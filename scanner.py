@@ -118,8 +118,6 @@ OSLO_TICKERS = {
     "ACR.OL": "Axactor",
     "SBO.OL": "Selvaag Bolig",
     "MORG.OL": "Sparebanken Møre",
-    "KAHOT.OL": "Kahoot!",
-    "MEL.OL": "Meltwater",
 
     # ── 100+ (midcap/smallcap) ──
     "AKVA.OL": "AKVA Group",
@@ -146,7 +144,6 @@ OSLO_TICKERS = {
     "JIN.OL": "Jinhui Shipping",
     "BOR.OL": "Borgestad",
     "PCIB.OL": "PCI Biotech",
-    "GIG.OL": "Gaming Innovation Group",
     "VVL.OL": "Voss Veksel- og Landmandsbank",
     "NORBT.OL": "Norbit",
     "CADLR.OL": "Cadeler",
