@@ -2,3 +2,4 @@ streamlit>=1.30.0
 yfinance>=0.2.36
 pandas>=2.0.0
 streamlit-autorefresh>=1.0.1
+curl_cffi>=0.7.0

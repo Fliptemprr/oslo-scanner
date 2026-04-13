@@ -1,9 +1,8 @@
 """
-Oslo Børs Swing Trading Scanner – MVP
-======================================
-Scanner for swing trading-kandidater på Oslo Børs.
-SMA 200, SMA 50, RSI 14, volum, relative avstander.
-Setup-typer: Trend / Pullback / Breakout / Momentum / Extended / No setup.
+Oslo Børs Swing Trading Scanner – v2
+=====================================
+Swing trading scanner med forbedret scoring, bedre filtrering,
+og tydeligere setup-klassifisering.
 
 Kjør:  streamlit run scanner.py
 """
@@ -23,20 +22,18 @@ from pathlib import Path
 # ──────────────────────────────────────────────────────────────
 
 WATCHLIST_FILE = Path("watchlist.json")
-DEFAULT_MIN_AVG_VOLUME = 50_000
 
-# Batch-innstillinger for yfinance (unngå rate limit)
-BATCH_SIZE = 20       # tickers per batch
-BATCH_DELAY = 5       # sekunder mellom batches
+# [FIX #5] Default likviditet økt — 50k var altfor lavt for reell trading
+DEFAULT_MIN_AVG_VOLUME = 200_000
+
+BATCH_SIZE = 20
+BATCH_DELAY = 5
 
 # ──────────────────────────────────────────────────────────────
-# VERIFISERT OSLO BØRS TICKER-LISTE (april 2026)
-# Basert på aktive listings fra Euronext Oslo Børs.
-# Format: {"TICKER.OL": "Selskapsnavn"}
-# Tickers som ikke finnes i yfinance hoppes automatisk over.
+# OSLO BØRS TICKER-LISTE (verifisert april 2026)
 # ──────────────────────────────────────────────────────────────
 OSLO_TICKERS = {
-    # ── Topp 50 etter markedsverdi ──
+    # ── OBX / Store selskaper ──
     "EQNR.OL": "Equinor",
     "DNB.OL": "DNB Bank",
     "KOG.OL": "Kongsberg Gruppen",
@@ -110,8 +107,8 @@ OSLO_TICKERS = {
     "NEL.OL": "Nel Hydrogen",
     "MEDI.OL": "Medistim",
     "BEL.OL": "Belships",
-    "REACH.OL": "Reach Subsea",
     "BOUV.OL": "Bouvet",
+    "REACH.OL": "Reach Subsea",
     "MULTI.OL": "Multiconsult",
     "PEXIP.OL": "Pexip",
     "VOLUE.OL": "Volue",
@@ -121,6 +118,8 @@ OSLO_TICKERS = {
     "ACR.OL": "Axactor",
     "SBO.OL": "Selvaag Bolig",
     "MORG.OL": "Sparebanken Møre",
+    "KAHOT.OL": "Kahoot!",
+    "MEL.OL": "Meltwater",
 
     # ── 100+ (midcap/smallcap) ──
     "AKVA.OL": "AKVA Group",
@@ -128,7 +127,6 @@ OSLO_TICKERS = {
     "NRC.OL": "NRC Group",
     "BMA.OL": "Byggma",
     "NAVA.OL": "Navamedic",
-    "KAHOT.OL": "Kahoot!",
     "RECSI.OL": "REC Silicon",
     "HELG.OL": "Helgeland Sparebank",
     "SPOG.OL": "Sparebanken Øst",
@@ -137,7 +135,7 @@ OSLO_TICKERS = {
     "GYL.OL": "Gyldendal",
     "EIOF.OL": "Eidesvik Offshore",
     "ARCH.OL": "Archer",
-    "ELMRA.OL": "Elmera Group (ex Fjordkraft)",
+    "ELMRA.OL": "Elmera Group",
     "EMGS.OL": "Electromagnetic Geoservices",
     "PEN.OL": "Panoro Energy",
     "NAPA.OL": "Napatech",
@@ -163,7 +161,7 @@ OSLO_TICKERS = {
 
 
 # ──────────────────────────────────────────────────────────────
-# RSI-BEREGNING
+# RSI
 # ──────────────────────────────────────────────────────────────
 
 def beregn_rsi(serie: pd.Series, periode: int = 14) -> pd.Series:
@@ -177,15 +175,26 @@ def beregn_rsi(serie: pd.Series, periode: int = 14) -> pd.Series:
 
 
 # ──────────────────────────────────────────────────────────────
-# DATAHENTING (batch med retry)
+# DATAHENTING (batch med retry + curl_cffi for å unngå rate limit)
 # ──────────────────────────────────────────────────────────────
+
+def _lag_session():
+    """Lager en session som etterlikner Chrome — unngår Yahoo TLS fingerprinting."""
+    try:
+        from curl_cffi import requests as cffi_requests
+        session = cffi_requests.Session(impersonate="chrome")
+        return session
+    except ImportError:
+        return None
 
 @st.cache_data(ttl=600, show_spinner=False)
 def hent_data(ticker_dict: dict, dager_historikk: int = 250) -> pd.DataFrame:
-    """Henter kursdata i batches og beregner alle indikatorer."""
     tickers_liste = list(ticker_dict.keys())
     start = datetime.now() - timedelta(days=dager_historikk + 50)
     end = datetime.now()
+
+    # Bruk curl_cffi session for å unngå 429-feil
+    session = _lag_session()
 
     alle_data = {}
     progress = st.progress(0, text="Henter data...")
@@ -199,40 +208,35 @@ def hent_data(ticker_dict: dict, dager_historikk: int = 250) -> pd.DataFrame:
             text=f"Batch {batch_idx}/{total_batches} — {min(batch_nr + BATCH_SIZE, len(tickers_liste))}/{len(tickers_liste)} aksjer..."
         )
 
-        # Forsøk opptil 2 ganger per batch
         for forsok in range(2):
             try:
                 raw = yf.download(
                     batch, start=start, end=end,
                     progress=False, auto_adjust=True,
-                    timeout=30, group_by="ticker", threads=True
+                    timeout=30, group_by="ticker", threads=True,
+                    session=session
                 )
                 if raw is not None and not raw.empty:
                     for ticker in batch:
                         try:
-                            if len(batch) == 1:
-                                df_t = raw.copy()
-                            else:
-                                df_t = raw[ticker].copy()
+                            df_t = raw.copy() if len(batch) == 1 else raw[ticker].copy()
                             df_t = df_t.dropna(how="all")
                             if len(df_t) >= 50:
                                 alle_data[ticker] = df_t
                         except (KeyError, TypeError):
                             continue
-                break  # Vellykket, gå til neste batch
+                break
             except Exception as e:
                 if forsok == 0:
-                    time.sleep(BATCH_DELAY * 2)  # Ekstra lang pause ved feil
+                    time.sleep(BATCH_DELAY * 2)
                 else:
-                    print(f"⚠️  Batch-feil etter retry: {e}")
+                    print(f"⚠️  Batch-feil: {e}")
 
-        # Pause mellom batches
         if batch_nr + BATCH_SIZE < len(tickers_liste):
             time.sleep(BATCH_DELAY)
 
     progress.empty()
 
-    # Beregn indikatorer
     resultater = []
     for ticker, df in alle_data.items():
         try:
@@ -301,7 +305,8 @@ def hent_data(ticker_dict: dict, dager_historikk: int = 250) -> pd.DataFrame:
 
 
 # ──────────────────────────────────────────────────────────────
-# SETUP-KLASSIFISERING
+# SETUP-KLASSIFISERING (v3)
+# Oppdatert: Pullback/Breakout strammet, ny Early Pullback
 # ──────────────────────────────────────────────────────────────
 
 def klassifiser_setup(df: pd.DataFrame) -> pd.DataFrame:
@@ -318,18 +323,39 @@ def klassifiser_setup(df: pd.DataFrame) -> pd.DataFrame:
         if over200 is None or rsi is None or avst_sma50 is None:
             setups.append("No setup"); continue
 
-        if over200 and over50 and rsi > 75 and avst_sma50 > 8:
+        # Extended: RSI>75 ELLER >8% over SMA50 — dårlige entries, fang først
+        if rsi > 75 or (over200 and avst_sma50 > 8):
             setups.append("Extended"); continue
 
-        if over200 and avst_high is not None and avst_high >= -1.5 and vol_ratio >= 1.0 and rsi > 50:
+        # Breakout: nær 20d high, STERK volum, IKKE for langt over SMA50
+        if (over200
+                and avst_high is not None and avst_high >= -2.0
+                and vol_ratio >= 1.5
+                and rsi > 50
+                and avst_sma50 <= 5.0):
             setups.append("Breakout"); continue
 
-        if over200 and avst_sma50 is not None and -1.0 <= avst_sma50 <= 3.0 and 35 <= rsi <= 55:
+        # Pullback: kontrollert tilbaketrekking nær SMA50
+        if (over200
+                and avst_sma50 is not None and -2.0 <= avst_sma50 <= 1.0
+                and 35 <= rsi <= 55):
             setups.append("Pullback"); continue
 
-        if over200 and over50 and pct_idag > 0.5 and vol_ratio >= 1.0 and rsi > 50:
+        # Early Pullback: forkant-trade, volum ennå ikke kommet
+        if (over200
+                and avst_sma50 is not None and -2.0 <= avst_sma50 <= 1.0
+                and 40 <= rsi <= 50
+                and vol_ratio < 1.0):
+            setups.append("Early Pullback"); continue
+
+        # Momentum: sterk dag med volumbekreftelse
+        if (over200 and over50
+                and pct_idag > 0.5
+                and vol_ratio >= 1.0
+                and rsi > 50):
             setups.append("Momentum"); continue
 
+        # Trend: stabil over begge SMA
         if over200 and over50 and 40 <= rsi <= 70:
             setups.append("Trend"); continue
 
@@ -340,27 +366,74 @@ def klassifiser_setup(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ──────────────────────────────────────────────────────────────
-# SCORING (0–10)
+# TRADE SCORE (0–10) — prioriterer entry timing
+#
+#   +2  Kurs over SMA 200
+#   +1  Kurs over SMA 50
+#   +2  Nær SMA50 (−2% til +2%)
+#   +1  RSI mellom 40–60
+#   +2  Vol ratio > 1.2
+#   +1  Vol ratio > 1.0 (men < 1.2)
+#   +1  Snittvolum 20d > 500k
+#   Maks = 10
 # ──────────────────────────────────────────────────────────────
 
 def beregn_score(df: pd.DataFrame) -> pd.DataFrame:
     scores = []
+    signaler = []
+    forklaringer = []
+
     for _, row in df.iterrows():
         p = 0
-        if row.get("Over SMA200"): p += 2
-        if row.get("Over SMA50"): p += 1
+        info = []
+
+        # Over SMA 200
+        if row.get("Over SMA200"):
+            p += 2; info.append("SMA200 +2")
+
+        # Over SMA 50
+        if row.get("Over SMA50"):
+            p += 1; info.append("SMA50 +1")
+
+        # Nær SMA50 (−2% til +2%) — entry timing
         avst = row.get("Avst SMA50 %")
-        if avst is not None and 0 <= avst <= 5: p += 1
+        if avst is not None and -2.0 <= avst <= 2.0:
+            p += 2; info.append("NærSMA50 +2")
+
+        # RSI sweet spot (40–60)
         rsi = row.get("RSI 14")
-        if rsi is not None and 40 <= rsi <= 65: p += 1
-        if rsi is not None and 30 <= rsi <= 70: p += 1
-        if row.get("Vol Ratio", 0) >= 1.0: p += 1
-        avst_h = row.get("Avst 20d High %")
-        if avst_h is not None and avst_h >= -2.0: p += 1
-        if row.get("Snitt Vol 20d", 0) > 100_000: p += 1
-        if row.get("% i dag", 0) > 0: p += 1
-        scores.append(min(p, 10))
+        if rsi is not None and 40 <= rsi <= 60:
+            p += 1; info.append("RSI +1")
+
+        # Volum — sterk bekreftelse
+        vol_ratio = row.get("Vol Ratio", 0)
+        if vol_ratio > 1.2:
+            p += 2; info.append("Vol>1.2 +2")
+        elif vol_ratio > 1.0:
+            p += 1; info.append("Vol>1.0 +1")
+
+        # Likviditet
+        if row.get("Snitt Vol 20d", 0) > 500_000:
+            p += 1; info.append("Likv +1")
+
+        # Klamp 0–10
+        final = max(0, min(p, 10))
+        scores.append(final)
+        forklaringer.append(", ".join(info))
+
+        # ── Trade Signal ──
+        if (final >= 8
+                and vol_ratio > 1.0
+                and avst is not None and -2.0 <= avst <= 2.0):
+            signaler.append("BUY")
+        elif final >= 6:
+            signaler.append("WATCH")
+        else:
+            signaler.append("SKIP")
+
     df["Score"] = scores
+    df["Signal"] = signaler
+    df["Score info"] = forklaringer
     return df
 
 
@@ -388,37 +461,51 @@ def lagre_watchlist(tickers: set):
 
 SETUP_EMOJI = {
     "Trend": "🟢", "Pullback": "🟡", "Breakout": "🔵",
-    "Momentum": "🟣", "Extended": "🔴", "No setup": "⚪",
+    "Early Pullback": "🟠", "Momentum": "🟣",
+    "Extended": "🔴", "No setup": "⚪",
 }
+
+SIGNAL_EMOJI = {"BUY": "🟢 BUY", "WATCH": "🟡 WATCH", "SKIP": "🔴 SKIP"}
 
 def formater_tabell(df: pd.DataFrame) -> pd.DataFrame:
     vis = df.copy()
     vis["Setup"] = vis["Setup"].apply(lambda x: f"{SETUP_EMOJI.get(x, '')} {x}")
+    vis["Signal"] = vis["Signal"].apply(lambda x: SIGNAL_EMOJI.get(x, x))
     vis["Over SMA200"] = vis["Over SMA200"].apply(lambda x: "✅" if x else ("❌" if x is False else "—"))
     vis["Over SMA50"] = vis["Over SMA50"].apply(lambda x: "✅" if x else ("❌" if x is False else "—"))
-    vis["Vol Ratio"] = vis["Vol Ratio"].apply(lambda x: f"{x:.1f}x")
+    vis["Vol Ratio"] = vis["Vol Ratio"].apply(lambda x: f"{'🟩 ' if x >= 1.5 else ''}{x:.1f}x")
     vis["Volum"] = vis["Volum"].apply(lambda x: f"{x:,.0f}".replace(",", " "))
     vis["Snitt Vol 20d"] = vis["Snitt Vol 20d"].apply(lambda x: f"{x:,.0f}".replace(",", " "))
     cols = [
-        "Ticker", "Selskap", "Kurs", "% i dag",
+        "Signal", "Ticker", "Selskap", "Kurs", "% i dag",
         "Over SMA200", "Over SMA50", "Avst SMA50 %",
-        "RSI 14", "Volum", "Snitt Vol 20d", "Vol Ratio",
+        "RSI 14", "Vol Ratio", "Volum", "Snitt Vol 20d",
         "Avst 20d High %", "Avst 20d Low %", "Setup", "Score",
     ]
     return vis[[c for c in cols if c in vis.columns]]
 
 
 # ──────────────────────────────────────────────────────────────
-# FILTER DEFAULTS + RESET
+# [FIX #4] FILTER DEFAULTS – checkboxes for setup, ikke dropdown
+# [FIX #5] Default likviditet 200k
 # ──────────────────────────────────────────────────────────────
 
 FILTER_DEFAULTS = {
-    "f_setup": [],
+    "f_pullback": False,
+    "f_early_pullback": False,
+    "f_breakout": False,
+    "f_trend": False,
+    "f_momentum": False,
+    "f_extended": False,
+    "f_no_setup": False,
+    "f_skjul_extended": True,
+    "f_signal": "Alle",
     "f_over_sma200": False,
     "f_over_sma50": False,
     "f_rsi": (20, 80),
     "f_avst_sma50": (-15.0, 15.0),
-    "f_vol_over_snitt": False,
+    "f_kun_hoyt_volum": False,
+    "f_min_vol_ratio": 0.0,
     "f_min_vol": DEFAULT_MIN_AVG_VOLUME,
     "f_min_score": 0,
 }
@@ -435,21 +522,22 @@ def reset_filtre():
 def main():
     st.set_page_config(page_title="Oslo Børs Scanner", page_icon="📈", layout="wide")
     st.title("📈 Oslo Børs Swing Trading Scanner")
+
     # ── AUTO-REFRESH ──
     refresh_options = {"Av": 0, "5 min": 5, "10 min": 10, "15 min": 15, "30 min": 30}
     col_title, col_refresh = st.columns([3, 1])
     with col_title:
-        st.caption(f"Scanner {len(OSLO_TICKERS)} aksjer på Oslo Børs — SMA, RSI, volum, pris-avstander.")
+        st.caption(f"Scanner {len(OSLO_TICKERS)} aksjer — SMA 200/50, RSI 14, volum, pris-avstander.")
     with col_refresh:
         refresh_valg = st.selectbox("Auto-refresh", list(refresh_options.keys()), index=3, label_visibility="collapsed")
 
     refresh_min = refresh_options[refresh_valg]
     if refresh_min > 0:
         teller = st_autorefresh(interval=refresh_min * 60 * 1000, key="auto_refresh")
-        # Tøm cache ved auto-refresh så vi får ferske data
         if teller and teller > 0:
             st.cache_data.clear()
 
+    # ── Session state ──
     if "watchlist" not in st.session_state:
         st.session_state.watchlist = last_watchlist()
     if "data" not in st.session_state:
@@ -458,10 +546,13 @@ def main():
         if key not in st.session_state:
             st.session_state[key] = val
 
-    # ── FILTERPANEL ──
+    # ══════════════════════════════════════════════════════
+    # DEL 1 – FILTERPANEL
+    # ══════════════════════════════════════════════════════
     st.markdown("---")
-    st.subheader("🔍 Filtre og kontroll")
+    st.subheader("🔍 Filtre")
 
+    # Scan + Reset
     col_scan, col_reset = st.columns([1, 1])
     with col_scan:
         scan_klikket = st.button("🔄 Scan nå", type="primary", width="stretch")
@@ -480,55 +571,124 @@ def main():
         st.warning("Ingen data. Trykk «Scan nå».")
         return
 
-    f1, f2, f3, f4 = st.columns(4)
-    with f1:
-        setup_filter = st.multiselect(
-            "Setup-type",
-            ["Trend", "Pullback", "Breakout", "Momentum", "Extended", "No setup"],
-            key="f_setup",
-        )
-    with f2:
+    # ── Setup-filter som checkboxes ──
+    st.markdown("**Setup-filter:**")
+    sc1, sc2, sc3, sc4, sc5, sc6, sc7 = st.columns(7)
+    with sc1:
+        f_pullback = st.checkbox("🟡 Pullback", key="f_pullback")
+    with sc2:
+        f_early_pb = st.checkbox("🟠 Early PB", key="f_early_pullback")
+    with sc3:
+        f_breakout = st.checkbox("🔵 Breakout", key="f_breakout")
+    with sc4:
+        f_trend = st.checkbox("🟢 Trend", key="f_trend")
+    with sc5:
+        f_momentum = st.checkbox("🟣 Momentum", key="f_momentum")
+    with sc6:
+        f_extended = st.checkbox("🔴 Extended", key="f_extended")
+    with sc7:
+        f_no_setup = st.checkbox("⚪ No setup", key="f_no_setup")
+
+    # ── Filtre ──
+    st.markdown("**Filtre:**")
+    fc1, fc2, fc3, fc4 = st.columns(4)
+
+    with fc1:
+        signal_filter = st.selectbox("📡 Trade Signal", ["Alle", "BUY", "WATCH", "SKIP"], key="f_signal")
+        skjul_extended = st.checkbox("🚫 Skjul Extended", key="f_skjul_extended",
+                                      help="Fjerner aksjer >8% over SMA50 / RSI>75")
         kun_sma200 = st.checkbox("Kun over SMA 200", key="f_over_sma200")
         kun_sma50 = st.checkbox("Kun over SMA 50", key="f_over_sma50")
-    with f3:
+
+    with fc2:
+        kun_hoyt_vol = st.checkbox("🔊 Kun høyt volum (>1x)", key="f_kun_hoyt_volum")
+        min_vol_ratio = st.slider("Min. Vol Ratio", 0.0, 5.0, step=0.1, key="f_min_vol_ratio")
+
+    with fc3:
         rsi_range = st.slider("RSI-range", 0, 100, key="f_rsi")
-    with f4:
         avst_range = st.slider("Avstand SMA50 %", -30.0, 30.0, step=0.5, key="f_avst_sma50")
 
-    f5, f6, f7 = st.columns(3)
-    with f5:
-        kun_vol = st.checkbox("Kun volum over snitt", key="f_vol_over_snitt")
-    with f6:
-        min_vol = st.number_input("Min. snittvolum 20d", min_value=0, step=10_000, key="f_min_vol")
-    with f7:
+    with fc4:
+        min_vol = st.number_input("Min. snittvolum 20d", min_value=0, step=50_000, key="f_min_vol",
+                                   help="200k+ anbefalt for trading")
         min_score = st.slider("Minimum score", 0, 10, key="f_min_score")
 
-    # Appliser filtre
+    # ── Appliser filtre ──
     f_df = df.copy()
+
+    # Likviditet
     f_df = f_df[f_df["Snitt Vol 20d"] >= min_vol]
-    if setup_filter:
-        f_df = f_df[f_df["Setup"].isin(setup_filter)]
+
+    # Signal-filter
+    if signal_filter != "Alle":
+        f_df = f_df[f_df["Signal"] == signal_filter]
+
+    # Setup-checkboxes: vis kun valgte, eller alle hvis ingen valgt
+    valgte_setups = []
+    if f_pullback: valgte_setups.append("Pullback")
+    if f_early_pb: valgte_setups.append("Early Pullback")
+    if f_breakout: valgte_setups.append("Breakout")
+    if f_trend: valgte_setups.append("Trend")
+    if f_momentum: valgte_setups.append("Momentum")
+    if f_extended: valgte_setups.append("Extended")
+    if f_no_setup: valgte_setups.append("No setup")
+
+    if valgte_setups:
+        f_df = f_df[f_df["Setup"].isin(valgte_setups)]
+
+    # [FIX #3] Skjul Extended
+    if skjul_extended and not f_extended:
+        f_df = f_df[f_df["Setup"] != "Extended"]
+
+    # SMA-filtre
     if kun_sma200:
         f_df = f_df[f_df["Over SMA200"] == True]
     if kun_sma50:
         f_df = f_df[f_df["Over SMA50"] == True]
-    if kun_vol:
+
+    # [FIX #1] Volumfiltre
+    if kun_hoyt_vol:
         f_df = f_df[f_df["Vol Ratio"] >= 1.0]
+    if min_vol_ratio > 0:
+        f_df = f_df[f_df["Vol Ratio"] >= min_vol_ratio]
+
+    # RSI + SMA50 avstand
     f_df = f_df[f_df["RSI 14"].notna() & (f_df["RSI 14"] >= rsi_range[0]) & (f_df["RSI 14"] <= rsi_range[1])]
     f_df = f_df[f_df["Avst SMA50 %"].notna() & (f_df["Avst SMA50 %"] >= avst_range[0]) & (f_df["Avst SMA50 %"] <= avst_range[1])]
+
+    # Score
     f_df = f_df[f_df["Score"] >= min_score]
+
+    # Sorter
     f_df = f_df.sort_values("Score", ascending=False).reset_index(drop=True)
 
-    # ── HOVEDTABELL ──
+    # ══════════════════════════════════════════════════════
+    # DEL 2 – HOVEDTABELL
+    # ══════════════════════════════════════════════════════
     st.markdown("---")
-    st.subheader(f"📊 Kandidater ({len(f_df)} aksjer)")
+
+    # Quick-stats
+    qs1, qs2, qs3, qs4, qs5, qs6 = st.columns(6)
+    total = len(f_df)
+    qs1.metric("Kandidater", total)
+    qs2.metric("🟢 BUY", len(f_df[f_df["Signal"] == "BUY"]) if total else 0)
+    qs3.metric("🟡 WATCH", len(f_df[f_df["Signal"] == "WATCH"]) if total else 0)
+    qs4.metric("Pullback", len(f_df[f_df["Setup"].isin(["Pullback", "Early Pullback"])]) if total else 0)
+    qs5.metric("Breakout", len(f_df[f_df["Setup"] == "Breakout"]) if total else 0)
+    qs6.metric("Trend", len(f_df[f_df["Setup"] == "Trend"]) if total else 0)
 
     if f_df.empty:
-        st.info("Ingen aksjer matcher filtrene.")
+        st.info("Ingen aksjer matcher filtrene. Juster filtre eller trykk «Reset filtre».")
     else:
         st.dataframe(formater_tabell(f_df), width="stretch", hide_index=True,
                       height=min(len(f_df) * 38 + 40, 700))
 
+        # Score-forklaring for topp-aksje
+        if len(f_df) > 0:
+            topp = f_df.iloc[0]
+            st.caption(f"Topp: **{topp['Ticker']}** ({topp['Selskap']}) — Score {topp['Score']}: {topp.get('Score info', '')}")
+
+        # Watchlist-knapper
         st.markdown("**Legg til / fjern fra watchlist:**")
         n_cols = min(len(f_df), 8)
         wl_cols = st.columns(n_cols)
@@ -541,7 +701,9 @@ def main():
                     lagre_watchlist(st.session_state.watchlist)
                     st.rerun()
 
-    # ── WATCHLIST ──
+    # ══════════════════════════════════════════════════════
+    # DEL 3 – WATCHLIST
+    # ══════════════════════════════════════════════════════
     st.markdown("---")
     st.subheader(f"⭐ Watchlist ({len(st.session_state.watchlist)})")
 
@@ -563,30 +725,38 @@ def main():
                     lagre_watchlist(st.session_state.watchlist)
                     st.rerun()
 
-    # ── FOOTER ──
+    # ══════════════════════════════════════════════════════
+    # FOOTER
+    # ══════════════════════════════════════════════════════
     st.markdown("---")
-    with st.expander("ℹ️ Scoringmodell og setup-logikk"):
+    with st.expander("ℹ️ Trade Score, Signal og setup-logikk (v3)"):
         st.markdown("""
-**Poengmodell (0–10):**
-| Poeng | Betingelse |
-|-------|-----------|
-| +2 | Kurs over SMA 200 |
-| +1 | Kurs over SMA 50 |
-| +1 | Nær SMA 50 (0–5 %) |
-| +1 | RSI sweet spot (40–65) |
-| +1 | RSI ikke ekstrem (30–70) |
-| +1 | Volum over snitt (≥ 1.0x) |
-| +1 | Nær 20d high (≥ −2 %) |
-| +1 | God likviditet (snittvolum > 100k) |
-| +1 | Positiv dag |
+**Trade Score (0–10) — fokus på entry timing:**
+| Poeng | Betingelse | Hvorfor |
+|-------|-----------|---------|
+| +2 | Over SMA 200 | Langsiktig trend |
+| +1 | Over SMA 50 | Kortsiktig trend |
+| +2 | Nær SMA50 (−2% til +2%) | Optimal entry-sone |
+| +1 | RSI 40–60 | Ikke overkjøpt/oversolgt |
+| +2 | Vol ratio > 1.2x | Sterk volumbekreftelse |
+| +1 | Vol ratio > 1.0x (men <1.2) | Moderat volum |
+| +1 | Snittvolum > 500k | Tradebar størrelse |
+
+**Trade Signal:**
+| Signal | Regel |
+|--------|-------|
+| 🟢 **BUY** | Score ≥ 8, vol ratio > 1, nær SMA50 (±2%) |
+| 🟡 **WATCH** | Score ≥ 6 |
+| 🔴 **SKIP** | Score < 6 |
 
 **Setup-typer:**
+- 🟡 **Pullback** — Over SMA200, avst SMA50 −2% til +1%, RSI 35–55
+- 🟠 **Early Pullback** — Som Pullback, men RSI 40–50 og vol < 1.0 (forkant-trade)
+- 🔵 **Breakout** — Over SMA200, nær 20d high (<2%), vol > 1.5x, RSI > 50, maks +5% over SMA50
 - 🟢 **Trend** — Over SMA200+50, RSI 40–70
-- 🟡 **Pullback** — Over SMA200, nær SMA50 (−1 til 3%), RSI 35–55
-- 🔵 **Breakout** — Over SMA200, nær 20d high, vol > snitt, RSI > 50
-- 🟣 **Momentum** — Over begge SMA, positiv dag, vol bekrefter, RSI > 50
-- 🔴 **Extended** — RSI > 75, > 8% over SMA50
-- ⚪ **No setup** — Matcher ingen
+- 🟣 **Momentum** — Over begge SMA, positiv dag, vol > 1.0, RSI > 50
+- 🔴 **Extended** — RSI > 75 eller >8% over SMA50 (unngå)
+- ⚪ **No setup** — Matcher ingen kriterier
         """)
 
     oslo_tid = datetime.now(ZoneInfo("Europe/Oslo")).strftime('%Y-%m-%d %H:%M')
