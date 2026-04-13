@@ -1,9 +1,9 @@
 """
 Oslo Børs Swing Trading Scanner – MVP
 ======================================
-Enkel scanner som finner swing trading-kandidater på Oslo Børs.
-Bruker SMA 200, SMA 50, RSI 14, volum og relative avstander.
-Kategoriserer aksjer som Trend / Pullback / Breakout / Momentum / Extended / No setup.
+Scanner for swing trading-kandidater på Oslo Børs.
+SMA 200, SMA 50, RSI 14, volum, relative avstander.
+Setup-typer: Trend / Pullback / Breakout / Momentum / Extended / No setup.
 
 Kjør:  streamlit run scanner.py
 """
@@ -12,7 +12,6 @@ import streamlit as st
 import pandas as pd
 import yfinance as yf
 import json
-import os
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -22,196 +21,152 @@ from pathlib import Path
 # ──────────────────────────────────────────────────────────────
 
 WATCHLIST_FILE = Path("watchlist.json")
-
-# Minimum gjennomsnittlig daglig volum siste 20 dager for å ikke bli filtrert bort
 DEFAULT_MIN_AVG_VOLUME = 50_000
 
+# Batch-innstillinger for yfinance (unngå rate limit)
+BATCH_SIZE = 20       # tickers per batch
+BATCH_DELAY = 4       # sekunder mellom batches
+
 # ──────────────────────────────────────────────────────────────
-# KOMPLETT OSLO BØRS TICKER-LISTE
+# VERIFISERT OSLO BØRS TICKER-LISTE (april 2026)
+# Basert på aktive listings fra Euronext Oslo Børs.
 # Format: {"TICKER.OL": "Selskapsnavn"}
-# yfinance bruker .OL-suffiks. Aksjer som ikke finnes hoppes over.
+# Tickers som ikke finnes i yfinance hoppes automatisk over.
 # ──────────────────────────────────────────────────────────────
-OBX_TICKERS = {
-    # ── OBX / Store selskaper ──
+OSLO_TICKERS = {
+    # ── Topp 50 etter markedsverdi ──
     "EQNR.OL": "Equinor",
     "DNB.OL": "DNB Bank",
-    "NHY.OL": "Norsk Hydro",
-    "MOWI.OL": "Mowi",
+    "KOG.OL": "Kongsberg Gruppen",
     "TEL.OL": "Telenor",
-    "YAR.OL": "Yara International",
-    "ORK.OL": "Orkla",
     "AKRBP.OL": "Aker BP",
+    "NHY.OL": "Norsk Hydro",
+    "YAR.OL": "Yara International",
+    "GJF.OL": "Gjensidige Forsikring",
+    "MOWI.OL": "Mowi",
+    "ORK.OL": "Orkla",
+    "VAR.OL": "Vår Energi",
+    "AKER.OL": "Aker",
     "SALM.OL": "SalMar",
     "SUBC.OL": "Subsea 7",
-    "NOD.OL": "Nordic Semiconductor",
-    "AKER.OL": "Aker",
-    "BAKKA.OL": "Bakkafrost",
-    "KOG.OL": "Kongsberg Gruppen",
-    "ENTRA.OL": "Entra",
-    "HAFNI.OL": "Hafnia",
-    "BWLPG.OL": "BW LPG",
-    "AKSO.OL": "Aker Solutions",
-    "FLNG.OL": "Flex LNG",
-    "BORR.OL": "Borr Drilling",
-    "SCATC.OL": "Scatec",
-    "CRAYN.OL": "Crayon Group",
-    "AUSS.OL": "Austevoll Seafood",
-    "LSG.OL": "Lerøy Seafood",
-    "MPCC.OL": "MPC Container Ships",
-    "SCHA.OL": "Schibsted A",
-    "SCHB.OL": "Schibsted B",
-    "AUTO.OL": "AutoStore Holdings",
-    "FRO.OL": "Frontline",
-    "GOGL.OL": "Golden Ocean Group",
-    "TGS.OL": "TGS",
-    "VAR.OL": "Vår Energi",
-    "OET.OL": "Okeanis Eco Tankers",
     "STB.OL": "Storebrand",
-    "GJF.OL": "Gjensidige Forsikring",
+    "FRO.OL": "Frontline",
+    "WAWI.OL": "Wallenius Wilhelmsen",
+    "PROT.OL": "Protector Forsikring",
+    "CMBTO.OL": "CMB.Tech (ex Golden Ocean)",
+    "AUTO.OL": "AutoStore Holdings",
     "TOM.OL": "Tomra Systems",
-    "BRG.OL": "Borregaard",
-    "ELK.OL": "Elkem",
-    "EPR.OL": "Europris",
-    "KID.OL": "Kid",
-    "VEI.OL": "Veidekke",
-    "SRBANK.OL": "SpareBank 1 SR-Bank",
-    "PEXIP.OL": "Pexip",
-    "VOLUE.OL": "Volue",
-    "NEL.OL": "Nel Hydrogen",
-    "KAHOT.OL": "Kahoot!",
-    "MEL.OL": "Meltwater",
-
-    # ── Olje, gass og energi ──
-    "AKA.OL": "Akastor",
-    "DNO.OL": "DNO International",
-    "PGS.OL": "Petroleum Geo-Services",
-    "PEN.OL": "Panoro Energy",
-    "ARCHER.OL": "Archer",
-    "ODL.OL": "Odfjell Drilling",
-    "SOFF.OL": "Solstad Offshore",
-    "DOF.OL": "DOF",
-    "EIOF.OL": "Eidesvik Offshore",
-    "EMGS.OL": "Electromagnetic Geoservices",
-    "SIOFF.OL": "Siem Offshore",
-    "REACH.OL": "Reach Subsea",
-    "BWO.OL": "BW Offshore",
-    "BWEK.OL": "BW Energy",
-    "NOR.OL": "Norwegian Energy Company",
-    "SHLF.OL": "Shelf Drilling",
-    "PRS.OL": "Prosafe",
-    "HAVI.OL": "Havila Shipping",
-    "AVANCE.OL": "Avance Gas",
-    "BON.OL": "Bonheur",
-    "AFK.OL": "Arendals Fossekompani",
-    "FKRAFT.OL": "Fjordkraft",
-
-    # ── Sjømat ──
-    "GSF.OL": "Grieg Seafood",
-    "NRS.OL": "Norway Royal Salmon",
-    "SSC.OL": "Scottish Salmon Company",
-
-    # ── Shipping og transport ──
-    "SNI.OL": "Stolt-Nielsen",
-    "ODF.OL": "Odfjell A",
-    "ODFB.OL": "Odfjell B",
-    "BEL.OL": "Belships",
-    "JIN.OL": "Jinhui Shipping",
-    "WILS.OL": "Wilson",
+    "HAFNI.OL": "Hafnia",
+    "NOD.OL": "Nordic Semiconductor",
+    "DOFG.OL": "DOF Group",
     "WWI.OL": "Wilh. Wilhelmsen A",
     "WWIB.OL": "Wilh. Wilhelmsen B",
-    "SBLK.OL": "Star Bulk Carriers",
-    "NAS.OL": "Norwegian Air Shuttle",
-    "AMSC.OL": "American Shipping Company",
-    "NTS.OL": "NTS",
-
-    # ── Bank og finans ──
-    "PARB.OL": "Pareto Bank",
-    "NONG.OL": "SpareBank 1 Nord-Norge",
     "MING.OL": "SpareBank 1 SMN",
+    "LSG.OL": "Lerøy Seafood",
+    "SPOL.OL": "SpareBank 1 Østlandet",
+    "BAKKA.OL": "Bakkafrost",
+    "VEI.OL": "Veidekke",
+    "HAUTO.OL": "Höegh Autoliners",
+    "ODL.OL": "Odfjell Drilling",
+    "TGS.OL": "TGS",
+    "KIT.OL": "Kitron",
+    "BWLPG.OL": "BW LPG",
+    "AUSS.OL": "Austevoll Seafood",
+    "SNI.OL": "Stolt-Nielsen",
+    "BRG.OL": "Borregaard",
+    "NONG.OL": "SpareBank 1 Nord-Norge",
+    "ATEA.OL": "Atea",
+    "NAS.OL": "Norwegian Air Shuttle",
+    "EPR.OL": "Europris",
+    "BWE.OL": "BW Energy",
+    "BNOR.OL": "BlueNord",
+    "BORR.OL": "Borr Drilling",
+    "ELO.OL": "Elopak",
+    "NORCO.OL": "Norconsult",
+    "SOMA.OL": "Solstad Maritime",
+    "MPCC.OL": "MPC Container Ships",
+
+    # ── 51–100 ──
+    "BONHR.OL": "Bonheur",
+    "ODF.OL": "Odfjell A",
+    "ODFB.OL": "Odfjell B",
+    "AKBM.OL": "Aker BioMarine",
+    "BWO.OL": "BW Offshore",
+    "AFK.OL": "Arendals Fossekompani",
+    "B2I.OL": "B2Impact",
+    "SATS.OL": "SATS",
+    "GSF.OL": "Grieg Seafood",
+    "RING.OL": "SpareBank 1 Ringerike Hadeland",
+    "ENTRA.OL": "Entra",
+    "SCATC.OL": "Scatec",
+    "DNO.OL": "DNO International",
+    "OET.OL": "Okeanis Eco Tankers",
+    "ELK.OL": "Elkem",
+    "AFG.OL": "AF Gruppen",
+    "AKSO.OL": "Aker Solutions",
+    "KID.OL": "Kid",
+    "NEL.OL": "Nel Hydrogen",
+    "MEDI.OL": "Medistim",
+    "BEL.OL": "Belships",
+    "BOUVET.OL": "Bouvet",
+    "REACH.OL": "Reach Subsea",
+    "MULTI.OL": "Multiconsult",
+    "PEXIP.OL": "Pexip",
+    "VOLUE.OL": "Volue",
+    "HEX.OL": "Hexagon Composites",
+    "PHO.OL": "Photocure",
+    "PARB.OL": "Pareto Bank",
+    "ACR.OL": "Axactor",
+    "SBO.OL": "Selvaag Bolig",
     "MORG.OL": "Sparebanken Møre",
     "SVEG.OL": "Sparebanken Vest",
-    "SOR.OL": "Sparebanken Sør",
-    "SPOG.OL": "Sparebanken Øst",
-    "SPOL.OL": "SpareBank 1 Østlandet",
-    "RING.OL": "SpareBank 1 Ringerike Hadeland",
-    "HELG.OL": "Helgeland Sparebank",
-    "AURG.OL": "Aurskog Sparebank",
-    "SADG.OL": "Sandnes Sparebank",
-    "TOTG.OL": "Totens Sparebank",
-    "SBVG.OL": "SpareBank 1 BV",
-    "SOAG.OL": "SpareBank 1 Østfold Akershus",
-    "SOGN.OL": "Sogn Sparebank",
-    "ABG.OL": "ABG Sundal Collier",
-    "ACR.OL": "Axactor",
-    "B2I.OL": "B2Impact",
-    "PROT.OL": "Protector Forsikring",
 
-    # ── Teknologi og IT ──
-    "ATEA.OL": "Atea",
-    "BOUVET.OL": "Bouvet",
-    "KIT.OL": "Kitron",
-    "ITE.OL": "Itera",
-    "WSTEP.OL": "Webstep",
-    "COV.OL": "ContextVision",
-    "QFR.OL": "Q-Free",
-    "STRONG.OL": "StrongPoint",
+    # ── 100+ (midcap/smallcap) ──
+    "AKVA.OL": "AKVA Group",
+    "KOA.OL": "Kongsberg Automotive",
+    "NRC.OL": "NRC Group",
+    "BMA.OL": "Byggma",
+    "NAVA.OL": "Navamedic",
+    "KAHOT.OL": "Kahoot!",
+    "RECSI.OL": "REC Silicon",
+    "SADG.OL": "Sandnes Sparebank",
+    "HELG.OL": "Helgeland Sparebank",
+    "SPOG.OL": "Sparebanken Øst",
+    "ENDUR.OL": "Endúr",
+    "POL.OL": "Polaris Media",
+    "GYL.OL": "Gyldendal",
+    "SHLF.OL": "Shelf Drilling",
+    "EIOF.OL": "Eidesvik Offshore",
+    "EMGS.OL": "Electromagnetic Geoservices",
+    "PEN.OL": "Panoro Energy",
     "NAPA.OL": "Napatech",
     "PLT.OL": "poLight",
-    "HIDDN.OL": "Hiddn Solutions",
-    "INFRNT.OL": "Infront",
-    "NORCO.OL": "Norconsult",
-    "MULTI.OL": "Multiconsult",
-    "RECSI.OL": "REC Silicon",
-
-    # ── Industri og bygg ──
-    "AFG.OL": "AF Gruppen",
-    "HEX.OL": "Hexagon Composites",
-    "KOA.OL": "Kongsberg Automotive",
-    "BMA.OL": "Byggma",
-    "AKVA.OL": "AKVA Group",
-    "NRC.OL": "NRC Group",
-    "ENDUR.OL": "Endúr",
-    "SBO.OL": "Selvaag Bolig",
-    "GOD.OL": "Goodtech",
-
-    # ── Eiendom ──
-    "OLT.OL": "Olav Thon Eiendomsselskap",
-    "NPRO.OL": "Norwegian Property",
-    "STORM.OL": "Storm Real Estate",
-
-    # ── Helse og biotek ──
-    "MEDI.OL": "Medistim",
-    "PHO.OL": "Photocure",
-    "NAVA.OL": "Navamedic",
-    "BGBIO.OL": "BerGenBio",
-    "NANO.OL": "Nordic Nanovector",
-    "TRVX.OL": "Targovax",
-    "PCIB.OL": "PCI Biotech",
-    "CARA.OL": "Carasent",
-
-    # ── Konsum og handel ──
-    "XXL.OL": "XXL",
-    "SATS.OL": "SATS",
-    "GYL.OL": "Gyldendal",
-    "POL.OL": "Polaris Media",
-
-    # ── Diverse ──
-    "INC.OL": "Incus Investor",
     "ZAL.OL": "Zalaris",
-    "MOBA.OL": "Morrow Bank",
-    "SSG.OL": "Self Storage Group",
+    "GOD.OL": "Goodtech",
+    "PRS.OL": "Prosafe",
+    "NPRO.OL": "Norwegian Property",
+    "JIN.OL": "Jinhui Shipping",
+    "BOR.OL": "Borgestad",
+    "PCIB.OL": "PCI Biotech",
     "GIG.OL": "Gaming Innovation Group",
     "VVL.OL": "Voss Veksel- og Landmandsbank",
-    "BOR.OL": "Borgestad",
+    "NORBT.OL": "Norbit",
+    "CADLR.OL": "Cadeler",
+    "COSH.OL": "Constellation Oil Services",
+    "VEND.OL": "Vend Marketplaces",
+    "TIETO.OL": "TietoEVRY",
+    "SWON.OL": "SoftwareOne",
+    "PUBLI.OL": "Public Property Invest",
+    "SB1NO.OL": "SpareBank 1 Sør-Norge",
+    "SBNOR.OL": "Sparebanken Norge",
 }
 
 
 # ──────────────────────────────────────────────────────────────
-# RSI-BEREGNING (ren pandas)
+# RSI-BEREGNING
 # ──────────────────────────────────────────────────────────────
 
 def beregn_rsi(serie: pd.Series, periode: int = 14) -> pd.Series:
-    """Beregner RSI (Relative Strength Index) med Wilder's smoothing."""
     delta = serie.diff()
     gevinst = delta.where(delta > 0, 0.0)
     tap = -delta.where(delta < 0, 0.0)
@@ -222,61 +177,62 @@ def beregn_rsi(serie: pd.Series, periode: int = 14) -> pd.Series:
 
 
 # ──────────────────────────────────────────────────────────────
-# DATAHENTING OG BEREGNINGER
+# DATAHENTING (batch med retry)
 # ──────────────────────────────────────────────────────────────
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=600, show_spinner=False)
 def hent_data(ticker_dict: dict, dager_historikk: int = 250) -> pd.DataFrame:
-    """
-    Henter kursdata fra yfinance i batch (unngår rate limiting).
-    Returnerer én rad per aksje med alle indikatorer.
-    """
+    """Henter kursdata i batches og beregner alle indikatorer."""
     tickers_liste = list(ticker_dict.keys())
     start = datetime.now() - timedelta(days=dager_historikk + 50)
     end = datetime.now()
 
-    # Last ned alle tickers i batches à 40 stk for å unngå rate limit
-    BATCH_SIZE = 40
     alle_data = {}
     progress = st.progress(0, text="Henter data...")
+    total_batches = (len(tickers_liste) - 1) // BATCH_SIZE + 1
 
     for batch_nr in range(0, len(tickers_liste), BATCH_SIZE):
         batch = tickers_liste[batch_nr:batch_nr + BATCH_SIZE]
-        batch_label = f"Batch {batch_nr // BATCH_SIZE + 1}/{(len(tickers_liste) - 1) // BATCH_SIZE + 1}"
+        batch_idx = batch_nr // BATCH_SIZE + 1
         progress.progress(
-            min((batch_nr + BATCH_SIZE) / len(tickers_liste), 1.0),
-            text=f"Henter {batch_label} ({min(batch_nr + BATCH_SIZE, len(tickers_liste))}/{len(tickers_liste)} aksjer)..."
+            min(batch_idx / total_batches, 1.0),
+            text=f"Batch {batch_idx}/{total_batches} — {min(batch_nr + BATCH_SIZE, len(tickers_liste))}/{len(tickers_liste)} aksjer..."
         )
-        try:
-            raw = yf.download(
-                batch, start=start, end=end,
-                progress=False, auto_adjust=True, timeout=30,
-                group_by="ticker", threads=True
-            )
-            if raw is not None and not raw.empty:
-                for ticker in batch:
-                    try:
-                        if len(batch) == 1:
-                            # Enkel ticker: kolonner er bare Close, Volume etc.
-                            df_t = raw.copy()
-                        else:
-                            # Multi-ticker: kolonner er (Ticker, Price)
-                            df_t = raw[ticker].copy()
-                        df_t = df_t.dropna(how="all")
-                        if len(df_t) >= 50:
-                            alle_data[ticker] = df_t
-                    except (KeyError, TypeError):
-                        continue
-        except Exception as e:
-            print(f"⚠️  Batch-feil: {e}")
 
-        # Liten pause mellom batches
+        # Forsøk opptil 2 ganger per batch
+        for forsok in range(2):
+            try:
+                raw = yf.download(
+                    batch, start=start, end=end,
+                    progress=False, auto_adjust=True,
+                    timeout=30, group_by="ticker", threads=True
+                )
+                if raw is not None and not raw.empty:
+                    for ticker in batch:
+                        try:
+                            if len(batch) == 1:
+                                df_t = raw.copy()
+                            else:
+                                df_t = raw[ticker].copy()
+                            df_t = df_t.dropna(how="all")
+                            if len(df_t) >= 50:
+                                alle_data[ticker] = df_t
+                        except (KeyError, TypeError):
+                            continue
+                break  # Vellykket, gå til neste batch
+            except Exception as e:
+                if forsok == 0:
+                    time.sleep(BATCH_DELAY * 2)  # Ekstra lang pause ved feil
+                else:
+                    print(f"⚠️  Batch-feil etter retry: {e}")
+
+        # Pause mellom batches
         if batch_nr + BATCH_SIZE < len(tickers_liste):
-            time.sleep(2)
+            time.sleep(BATCH_DELAY)
 
     progress.empty()
 
-    # Beregn indikatorer for hver aksje
+    # Beregn indikatorer
     resultater = []
     for ticker, df in alle_data.items():
         try:
@@ -306,7 +262,6 @@ def hent_data(ticker_dict: dict, dager_historikk: int = 250) -> pd.DataFrame:
 
             over_sma200 = siste_kurs > sma200 if sma200 else None
             over_sma50 = siste_kurs > sma50 if sma50 else None
-
             avstand_sma50_pct = round(((siste_kurs - sma50) / sma50) * 100, 2) if sma50 else None
 
             high_20d = float(high.tail(20).max())
@@ -333,7 +288,7 @@ def hent_data(ticker_dict: dict, dager_historikk: int = 250) -> pd.DataFrame:
                 "Avst 20d Low %": avstand_low_20d_pct,
             })
         except Exception as e:
-            print(f"⚠️  Feil ved beregning for {ticker}: {e}")
+            print(f"⚠️  Beregningsfeil {ticker}: {e}")
             continue
 
     if not resultater:
@@ -361,36 +316,22 @@ def klassifiser_setup(df: pd.DataFrame) -> pd.DataFrame:
         pct_idag = row.get("% i dag", 0)
 
         if over200 is None or rsi is None or avst_sma50 is None:
-            setups.append("No setup")
-            continue
+            setups.append("No setup"); continue
 
-        if over200 and over50 and rsi and rsi > 75 and avst_sma50 and avst_sma50 > 8:
-            setups.append("Extended")
-            continue
+        if over200 and over50 and rsi > 75 and avst_sma50 > 8:
+            setups.append("Extended"); continue
 
-        if (over200
-                and avst_high is not None and avst_high >= -1.5
-                and vol_ratio >= 1.0
-                and rsi > 50):
-            setups.append("Breakout")
-            continue
+        if over200 and avst_high is not None and avst_high >= -1.5 and vol_ratio >= 1.0 and rsi > 50:
+            setups.append("Breakout"); continue
 
-        if (over200
-                and avst_sma50 is not None and -1.0 <= avst_sma50 <= 3.0
-                and 35 <= rsi <= 55):
-            setups.append("Pullback")
-            continue
+        if over200 and avst_sma50 is not None and -1.0 <= avst_sma50 <= 3.0 and 35 <= rsi <= 55:
+            setups.append("Pullback"); continue
 
-        if (over200 and over50
-                and pct_idag > 0.5
-                and vol_ratio >= 1.0
-                and rsi > 50):
-            setups.append("Momentum")
-            continue
+        if over200 and over50 and pct_idag > 0.5 and vol_ratio >= 1.0 and rsi > 50:
+            setups.append("Momentum"); continue
 
         if over200 and over50 and 40 <= rsi <= 70:
-            setups.append("Trend")
-            continue
+            setups.append("Trend"); continue
 
         setups.append("No setup")
 
@@ -399,49 +340,27 @@ def klassifiser_setup(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ──────────────────────────────────────────────────────────────
-# ENKEL SCORINGMODELL (0–10)
+# SCORING (0–10)
 # ──────────────────────────────────────────────────────────────
 
 def beregn_score(df: pd.DataFrame) -> pd.DataFrame:
     scores = []
-    detaljer = []
     for _, row in df.iterrows():
-        poeng = 0
-        info = []
-
-        if row.get("Over SMA200"):
-            poeng += 2; info.append("SMA200✓")
-        if row.get("Over SMA50"):
-            poeng += 1; info.append("SMA50✓")
-
+        p = 0
+        if row.get("Over SMA200"): p += 2
+        if row.get("Over SMA50"): p += 1
         avst = row.get("Avst SMA50 %")
-        if avst is not None and 0 <= avst <= 5:
-            poeng += 1; info.append("NærSMA50")
-
+        if avst is not None and 0 <= avst <= 5: p += 1
         rsi = row.get("RSI 14")
-        if rsi is not None and 40 <= rsi <= 65:
-            poeng += 1; info.append("RSI-sweet")
-        if rsi is not None and 30 <= rsi <= 70:
-            poeng += 1; info.append("RSI-ok")
-
-        if row.get("Vol Ratio", 0) >= 1.0:
-            poeng += 1; info.append("Vol✓")
-
+        if rsi is not None and 40 <= rsi <= 65: p += 1
+        if rsi is not None and 30 <= rsi <= 70: p += 1
+        if row.get("Vol Ratio", 0) >= 1.0: p += 1
         avst_h = row.get("Avst 20d High %")
-        if avst_h is not None and avst_h >= -2.0:
-            poeng += 1; info.append("NærHigh")
-
-        if row.get("Snitt Vol 20d", 0) > 100_000:
-            poeng += 1; info.append("Likv✓")
-
-        if row.get("% i dag", 0) > 0:
-            poeng += 1; info.append("Grønn dag")
-
-        scores.append(min(poeng, 10))
-        detaljer.append(", ".join(info))
-
+        if avst_h is not None and avst_h >= -2.0: p += 1
+        if row.get("Snitt Vol 20d", 0) > 100_000: p += 1
+        if row.get("% i dag", 0) > 0: p += 1
+        scores.append(min(p, 10))
     df["Score"] = scores
-    df["Score detaljer"] = detaljer
     return df
 
 
@@ -458,7 +377,6 @@ def last_watchlist() -> set:
             return set()
     return set()
 
-
 def lagre_watchlist(tickers: set):
     with open(WATCHLIST_FILE, "w") as f:
         json.dump(sorted(list(tickers)), f, indent=2)
@@ -468,28 +386,26 @@ def lagre_watchlist(tickers: set):
 # VISNING
 # ──────────────────────────────────────────────────────────────
 
-SETUP_FARGER = {
+SETUP_EMOJI = {
     "Trend": "🟢", "Pullback": "🟡", "Breakout": "🔵",
     "Momentum": "🟣", "Extended": "🔴", "No setup": "⚪",
 }
 
-
-def formater_visningstabell(df: pd.DataFrame) -> pd.DataFrame:
+def formater_tabell(df: pd.DataFrame) -> pd.DataFrame:
     vis = df.copy()
-    vis["Setup"] = vis["Setup"].apply(lambda x: f"{SETUP_FARGER.get(x, '')} {x}")
+    vis["Setup"] = vis["Setup"].apply(lambda x: f"{SETUP_EMOJI.get(x, '')} {x}")
     vis["Over SMA200"] = vis["Over SMA200"].apply(lambda x: "✅" if x else ("❌" if x is False else "—"))
     vis["Over SMA50"] = vis["Over SMA50"].apply(lambda x: "✅" if x else ("❌" if x is False else "—"))
     vis["Vol Ratio"] = vis["Vol Ratio"].apply(lambda x: f"{x:.1f}x")
     vis["Volum"] = vis["Volum"].apply(lambda x: f"{x:,.0f}".replace(",", " "))
     vis["Snitt Vol 20d"] = vis["Snitt Vol 20d"].apply(lambda x: f"{x:,.0f}".replace(",", " "))
-    kolonner = [
+    cols = [
         "Ticker", "Selskap", "Kurs", "% i dag",
         "Over SMA200", "Over SMA50", "Avst SMA50 %",
         "RSI 14", "Volum", "Snitt Vol 20d", "Vol Ratio",
-        "Avst 20d High %", "Avst 20d Low %",
-        "Setup", "Score",
+        "Avst 20d High %", "Avst 20d Low %", "Setup", "Score",
     ]
-    return vis[[k for k in kolonner if k in vis.columns]]
+    return vis[[c for c in cols if c in vis.columns]]
 
 
 # ──────────────────────────────────────────────────────────────
@@ -507,9 +423,7 @@ FILTER_DEFAULTS = {
     "f_min_score": 0,
 }
 
-
 def reset_filtre():
-    """Callback som setter alle filtre tilbake til default."""
     for key, val in FILTER_DEFAULTS.items():
         st.session_state[key] = val
 
@@ -520,11 +434,9 @@ def reset_filtre():
 
 def main():
     st.set_page_config(page_title="Oslo Børs Scanner", page_icon="📈", layout="wide")
-
     st.title("📈 Oslo Børs Swing Trading Scanner")
-    st.caption("Scanner ~160 aksjer på Oslo Børs — finner kandidater basert på SMA, RSI, volum og pris-avstander.")
+    st.caption(f"Scanner {len(OSLO_TICKERS)} aksjer på Oslo Børs — SMA, RSI, volum, pris-avstander.")
 
-    # --- Initier session state ---
     if "watchlist" not in st.session_state:
         st.session_state.watchlist = last_watchlist()
     if "data" not in st.session_state:
@@ -533,9 +445,7 @@ def main():
         if key not in st.session_state:
             st.session_state[key] = val
 
-    # ──────────────────────────────────────────────────────
-    # DEL 1 – FILTERPANEL
-    # ──────────────────────────────────────────────────────
+    # ── FILTERPANEL ──
     st.markdown("---")
     st.subheader("🔍 Filtre og kontroll")
 
@@ -547,128 +457,100 @@ def main():
 
     if scan_klikket:
         st.cache_data.clear()
-        st.session_state.data = hent_data(OBX_TICKERS)
+        st.session_state.data = hent_data(OSLO_TICKERS)
         st.success(f"✅ Skannet {len(st.session_state.data)} aksjer")
     elif st.session_state.data is None:
-        st.session_state.data = hent_data(OBX_TICKERS)
+        st.session_state.data = hent_data(OSLO_TICKERS)
 
     df = st.session_state.data
-
     if df is None or df.empty:
-        st.warning("Ingen data tilgjengelig. Trykk «Scan nå» for å prøve igjen.")
+        st.warning("Ingen data. Trykk «Scan nå».")
         return
 
-    # --- Filtre (keys = session state for reset) ---
     f1, f2, f3, f4 = st.columns(4)
-
     with f1:
         setup_filter = st.multiselect(
             "Setup-type",
-            options=["Trend", "Pullback", "Breakout", "Momentum", "Extended", "No setup"],
+            ["Trend", "Pullback", "Breakout", "Momentum", "Extended", "No setup"],
             key="f_setup",
         )
     with f2:
-        kun_over_sma200 = st.checkbox("Kun over SMA 200", key="f_over_sma200")
-        kun_over_sma50 = st.checkbox("Kun over SMA 50", key="f_over_sma50")
+        kun_sma200 = st.checkbox("Kun over SMA 200", key="f_over_sma200")
+        kun_sma50 = st.checkbox("Kun over SMA 50", key="f_over_sma50")
     with f3:
         rsi_range = st.slider("RSI-range", 0, 100, key="f_rsi")
     with f4:
-        avst_sma50_range = st.slider("Avstand SMA50 %", -30.0, 30.0, step=0.5, key="f_avst_sma50")
+        avst_range = st.slider("Avstand SMA50 %", -30.0, 30.0, step=0.5, key="f_avst_sma50")
 
     f5, f6, f7 = st.columns(3)
     with f5:
-        kun_vol_over_snitt = st.checkbox("Kun volum over snitt", key="f_vol_over_snitt")
+        kun_vol = st.checkbox("Kun volum over snitt", key="f_vol_over_snitt")
     with f6:
-        min_snitt_volum = st.number_input("Min. snittvolum 20d", min_value=0, step=10_000, key="f_min_vol")
+        min_vol = st.number_input("Min. snittvolum 20d", min_value=0, step=10_000, key="f_min_vol")
     with f7:
         min_score = st.slider("Minimum score", 0, 10, key="f_min_score")
 
-    # --- Appliser filtre ---
-    filtrert = df.copy()
-    filtrert = filtrert[filtrert["Snitt Vol 20d"] >= min_snitt_volum]
-
+    # Appliser filtre
+    f_df = df.copy()
+    f_df = f_df[f_df["Snitt Vol 20d"] >= min_vol]
     if setup_filter:
-        filtrert = filtrert[filtrert["Setup"].isin(setup_filter)]
-    if kun_over_sma200:
-        filtrert = filtrert[filtrert["Over SMA200"] == True]
-    if kun_over_sma50:
-        filtrert = filtrert[filtrert["Over SMA50"] == True]
-    if kun_vol_over_snitt:
-        filtrert = filtrert[filtrert["Vol Ratio"] >= 1.0]
+        f_df = f_df[f_df["Setup"].isin(setup_filter)]
+    if kun_sma200:
+        f_df = f_df[f_df["Over SMA200"] == True]
+    if kun_sma50:
+        f_df = f_df[f_df["Over SMA50"] == True]
+    if kun_vol:
+        f_df = f_df[f_df["Vol Ratio"] >= 1.0]
+    f_df = f_df[f_df["RSI 14"].notna() & (f_df["RSI 14"] >= rsi_range[0]) & (f_df["RSI 14"] <= rsi_range[1])]
+    f_df = f_df[f_df["Avst SMA50 %"].notna() & (f_df["Avst SMA50 %"] >= avst_range[0]) & (f_df["Avst SMA50 %"] <= avst_range[1])]
+    f_df = f_df[f_df["Score"] >= min_score]
+    f_df = f_df.sort_values("Score", ascending=False).reset_index(drop=True)
 
-    filtrert = filtrert[
-        filtrert["RSI 14"].notna() &
-        (filtrert["RSI 14"] >= rsi_range[0]) &
-        (filtrert["RSI 14"] <= rsi_range[1])
-    ]
-    filtrert = filtrert[
-        filtrert["Avst SMA50 %"].notna() &
-        (filtrert["Avst SMA50 %"] >= avst_sma50_range[0]) &
-        (filtrert["Avst SMA50 %"] <= avst_sma50_range[1])
-    ]
-    filtrert = filtrert[filtrert["Score"] >= min_score]
-    filtrert = filtrert.sort_values("Score", ascending=False).reset_index(drop=True)
-
-    # ──────────────────────────────────────────────────────
-    # DEL 2 – HOVEDTABELL
-    # ──────────────────────────────────────────────────────
+    # ── HOVEDTABELL ──
     st.markdown("---")
-    st.subheader(f"📊 Kandidater ({len(filtrert)} aksjer)")
+    st.subheader(f"📊 Kandidater ({len(f_df)} aksjer)")
 
-    if filtrert.empty:
-        st.info("Ingen aksjer matcher valgte filtre. Prøv å justere filtrene.")
+    if f_df.empty:
+        st.info("Ingen aksjer matcher filtrene.")
     else:
-        vis_df = formater_visningstabell(filtrert)
-        st.dataframe(vis_df, use_container_width=True, hide_index=True,
-                      height=min(len(vis_df) * 38 + 40, 700))
+        st.dataframe(formater_tabell(f_df), use_container_width=True, hide_index=True,
+                      height=min(len(f_df) * 38 + 40, 700))
 
         st.markdown("**Legg til / fjern fra watchlist:**")
-        cols_per_row = min(len(filtrert), 8)
-        wl_cols = st.columns(cols_per_row)
-        for i, (_, row) in enumerate(filtrert.iterrows()):
-            ticker = row["Ticker"]
-            col_idx = i % cols_per_row
-            with wl_cols[col_idx]:
-                in_wl = ticker in st.session_state.watchlist
-                label = f"{'⭐' if in_wl else '☆'} {ticker}"
-                if st.button(label, key=f"wl_{ticker}"):
-                    if in_wl:
-                        st.session_state.watchlist.discard(ticker)
-                    else:
-                        st.session_state.watchlist.add(ticker)
+        n_cols = min(len(f_df), 8)
+        wl_cols = st.columns(n_cols)
+        for i, (_, row) in enumerate(f_df.iterrows()):
+            t = row["Ticker"]
+            with wl_cols[i % n_cols]:
+                in_wl = t in st.session_state.watchlist
+                if st.button(f"{'⭐' if in_wl else '☆'} {t}", key=f"wl_{t}"):
+                    st.session_state.watchlist.discard(t) if in_wl else st.session_state.watchlist.add(t)
                     lagre_watchlist(st.session_state.watchlist)
                     st.rerun()
 
-    # ──────────────────────────────────────────────────────
-    # DEL 3 – WATCHLIST
-    # ──────────────────────────────────────────────────────
+    # ── WATCHLIST ──
     st.markdown("---")
-    st.subheader(f"⭐ Watchlist ({len(st.session_state.watchlist)} aksjer)")
+    st.subheader(f"⭐ Watchlist ({len(st.session_state.watchlist)})")
 
     if not st.session_state.watchlist:
-        st.info("Watchlisten er tom. Klikk ☆-knappene over for å legge til aksjer.")
+        st.info("Tom watchlist. Klikk ☆ for å legge til.")
     else:
-        wl_tickers = st.session_state.watchlist
-        wl_df = df[df["Ticker"].isin(wl_tickers)].sort_values("Score", ascending=False).reset_index(drop=True)
-
+        wl_df = df[df["Ticker"].isin(st.session_state.watchlist)].sort_values("Score", ascending=False)
         if wl_df.empty:
-            st.warning("Aksjene i watchlisten ble ikke funnet i siste scan.")
+            st.warning("Watchlist-aksjer ikke funnet i siste scan.")
         else:
-            st.dataframe(formater_visningstabell(wl_df), use_container_width=True, hide_index=True)
+            st.dataframe(formater_tabell(wl_df), use_container_width=True, hide_index=True)
 
-        cols_per_row = min(len(wl_tickers), 8)
-        fjern_cols = st.columns(cols_per_row)
-        for i, ticker in enumerate(sorted(wl_tickers)):
-            col_idx = i % cols_per_row
-            with fjern_cols[col_idx]:
-                if st.button(f"❌ {ticker}", key=f"fjern_{ticker}"):
-                    st.session_state.watchlist.discard(ticker)
+        n_cols = min(len(st.session_state.watchlist), 8)
+        fjern_cols = st.columns(n_cols)
+        for i, t in enumerate(sorted(st.session_state.watchlist)):
+            with fjern_cols[i % n_cols]:
+                if st.button(f"❌ {t}", key=f"rm_{t}"):
+                    st.session_state.watchlist.discard(t)
                     lagre_watchlist(st.session_state.watchlist)
                     st.rerun()
 
-    # ──────────────────────────────────────────────────────
-    # FOOTER
-    # ──────────────────────────────────────────────────────
+    # ── FOOTER ──
     st.markdown("---")
     with st.expander("ℹ️ Scoringmodell og setup-logikk"):
         st.markdown("""
@@ -678,23 +560,23 @@ def main():
 | +2 | Kurs over SMA 200 |
 | +1 | Kurs over SMA 50 |
 | +1 | Nær SMA 50 (0–5 %) |
-| +1 | RSI i sweet spot (40–65) |
+| +1 | RSI sweet spot (40–65) |
 | +1 | RSI ikke ekstrem (30–70) |
-| +1 | Volum over snitt (ratio ≥ 1.0x) |
-| +1 | Nær 20-dagers high (≥ −2 %) |
+| +1 | Volum over snitt (≥ 1.0x) |
+| +1 | Nær 20d high (≥ −2 %) |
 | +1 | God likviditet (snittvolum > 100k) |
-| +1 | Positiv dagsendring |
+| +1 | Positiv dag |
 
-**Setup-klassifisering:**
-- 🟢 **Trend** — Over SMA200 + SMA50, RSI 40–70
-- 🟡 **Pullback** — Over SMA200, nær SMA50 (−1 til 3 %), RSI 35–55
-- 🔵 **Breakout** — Over SMA200, nær 20d high, volum over snitt, RSI > 50
-- 🟣 **Momentum** — Over SMA200+SMA50, positiv dag, volum bekrefter, RSI > 50
-- 🔴 **Extended** — Over SMA200+SMA50, RSI > 75, langt fra SMA50 (> 8 %)
-- ⚪ **No setup** — Matcher ingen kriterier
+**Setup-typer:**
+- 🟢 **Trend** — Over SMA200+50, RSI 40–70
+- 🟡 **Pullback** — Over SMA200, nær SMA50 (−1 til 3%), RSI 35–55
+- 🔵 **Breakout** — Over SMA200, nær 20d high, vol > snitt, RSI > 50
+- 🟣 **Momentum** — Over begge SMA, positiv dag, vol bekrefter, RSI > 50
+- 🔴 **Extended** — RSI > 75, > 8% over SMA50
+- ⚪ **No setup** — Matcher ingen
         """)
 
-    st.caption(f"Sist oppdatert: {datetime.now().strftime('%Y-%m-%d %H:%M')} | Data: yfinance | {len(OBX_TICKERS)} aksjer i universet")
+    st.caption(f"Oppdatert: {datetime.now().strftime('%Y-%m-%d %H:%M')} | yfinance (forsinket) | {len(OSLO_TICKERS)} aksjer")
 
 
 if __name__ == "__main__":
