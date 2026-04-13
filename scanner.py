@@ -9,11 +9,13 @@ Kjør:  streamlit run scanner.py
 """
 
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 import pandas as pd
 import yfinance as yf
 import json
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 # ──────────────────────────────────────────────────────────────
@@ -25,7 +27,7 @@ DEFAULT_MIN_AVG_VOLUME = 50_000
 
 # Batch-innstillinger for yfinance (unngå rate limit)
 BATCH_SIZE = 20       # tickers per batch
-BATCH_DELAY = 4       # sekunder mellom batches
+BATCH_DELAY = 5       # sekunder mellom batches
 
 # ──────────────────────────────────────────────────────────────
 # VERIFISERT OSLO BØRS TICKER-LISTE (april 2026)
@@ -108,8 +110,8 @@ OSLO_TICKERS = {
     "NEL.OL": "Nel Hydrogen",
     "MEDI.OL": "Medistim",
     "BEL.OL": "Belships",
-    "BOUVET.OL": "Bouvet",
     "REACH.OL": "Reach Subsea",
+    "BOUV.OL": "Bouvet",
     "MULTI.OL": "Multiconsult",
     "PEXIP.OL": "Pexip",
     "VOLUE.OL": "Volue",
@@ -119,7 +121,6 @@ OSLO_TICKERS = {
     "ACR.OL": "Axactor",
     "SBO.OL": "Selvaag Bolig",
     "MORG.OL": "Sparebanken Møre",
-    "SVEG.OL": "Sparebanken Vest",
 
     # ── 100+ (midcap/smallcap) ──
     "AKVA.OL": "AKVA Group",
@@ -129,14 +130,14 @@ OSLO_TICKERS = {
     "NAVA.OL": "Navamedic",
     "KAHOT.OL": "Kahoot!",
     "RECSI.OL": "REC Silicon",
-    "SADG.OL": "Sandnes Sparebank",
     "HELG.OL": "Helgeland Sparebank",
     "SPOG.OL": "Sparebanken Øst",
     "ENDUR.OL": "Endúr",
     "POL.OL": "Polaris Media",
     "GYL.OL": "Gyldendal",
-    "SHLF.OL": "Shelf Drilling",
     "EIOF.OL": "Eidesvik Offshore",
+    "ARCH.OL": "Archer",
+    "ELMRA.OL": "Elmera Group (ex Fjordkraft)",
     "EMGS.OL": "Electromagnetic Geoservices",
     "PEN.OL": "Panoro Energy",
     "NAPA.OL": "Napatech",
@@ -144,7 +145,6 @@ OSLO_TICKERS = {
     "ZAL.OL": "Zalaris",
     "GOD.OL": "Goodtech",
     "PRS.OL": "Prosafe",
-    "NPRO.OL": "Norwegian Property",
     "JIN.OL": "Jinhui Shipping",
     "BOR.OL": "Borgestad",
     "PCIB.OL": "PCI Biotech",
@@ -435,7 +435,20 @@ def reset_filtre():
 def main():
     st.set_page_config(page_title="Oslo Børs Scanner", page_icon="📈", layout="wide")
     st.title("📈 Oslo Børs Swing Trading Scanner")
-    st.caption(f"Scanner {len(OSLO_TICKERS)} aksjer på Oslo Børs — SMA, RSI, volum, pris-avstander.")
+    # ── AUTO-REFRESH ──
+    refresh_options = {"Av": 0, "5 min": 5, "10 min": 10, "15 min": 15, "30 min": 30}
+    col_title, col_refresh = st.columns([3, 1])
+    with col_title:
+        st.caption(f"Scanner {len(OSLO_TICKERS)} aksjer på Oslo Børs — SMA, RSI, volum, pris-avstander.")
+    with col_refresh:
+        refresh_valg = st.selectbox("Auto-refresh", list(refresh_options.keys()), index=3, label_visibility="collapsed")
+
+    refresh_min = refresh_options[refresh_valg]
+    if refresh_min > 0:
+        teller = st_autorefresh(interval=refresh_min * 60 * 1000, key="auto_refresh")
+        # Tøm cache ved auto-refresh så vi får ferske data
+        if teller and teller > 0:
+            st.cache_data.clear()
 
     if "watchlist" not in st.session_state:
         st.session_state.watchlist = last_watchlist()
@@ -451,9 +464,9 @@ def main():
 
     col_scan, col_reset = st.columns([1, 1])
     with col_scan:
-        scan_klikket = st.button("🔄 Scan nå", type="primary", use_container_width=True)
+        scan_klikket = st.button("🔄 Scan nå", type="primary", width="stretch")
     with col_reset:
-        st.button("🗑️ Reset filtre", on_click=reset_filtre, use_container_width=True)
+        st.button("🗑️ Reset filtre", on_click=reset_filtre, width="stretch")
 
     if scan_klikket:
         st.cache_data.clear()
@@ -513,7 +526,7 @@ def main():
     if f_df.empty:
         st.info("Ingen aksjer matcher filtrene.")
     else:
-        st.dataframe(formater_tabell(f_df), use_container_width=True, hide_index=True,
+        st.dataframe(formater_tabell(f_df), width="stretch", hide_index=True,
                       height=min(len(f_df) * 38 + 40, 700))
 
         st.markdown("**Legg til / fjern fra watchlist:**")
@@ -539,7 +552,7 @@ def main():
         if wl_df.empty:
             st.warning("Watchlist-aksjer ikke funnet i siste scan.")
         else:
-            st.dataframe(formater_tabell(wl_df), use_container_width=True, hide_index=True)
+            st.dataframe(formater_tabell(wl_df), width="stretch", hide_index=True)
 
         n_cols = min(len(st.session_state.watchlist), 8)
         fjern_cols = st.columns(n_cols)
@@ -576,7 +589,8 @@ def main():
 - ⚪ **No setup** — Matcher ingen
         """)
 
-    st.caption(f"Oppdatert: {datetime.now().strftime('%Y-%m-%d %H:%M')} | yfinance (forsinket) | {len(OSLO_TICKERS)} aksjer")
+    oslo_tid = datetime.now(ZoneInfo("Europe/Oslo")).strftime('%Y-%m-%d %H:%M')
+    st.caption(f"Oppdatert: {oslo_tid} (Oslo) | yfinance (forsinket) | {len(OSLO_TICKERS)} aksjer")
 
 
 if __name__ == "__main__":
