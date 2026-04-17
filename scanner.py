@@ -644,6 +644,12 @@ COLS_BREAKOUT = [
 
 def formater_tabell(df, preset="Scan"):
     vis = df.copy()
+    # Embed company name as URL fragment so LinkColumn regex can display it as clickable text.
+    # The # fragment is ignored by Nordnet and the URL still works as a search redirect.
+    vis["Selskap"] = vis.apply(
+        lambda r: f"https://www.nordnet.no/search?query={r['Ticker']}#{r['Selskap']}",
+        axis=1,
+    )
     vis["Setup"] = vis["Setup"].apply(lambda x: f"{SETUP_EMOJI.get(x,'')} {x}")
     vis["Entry"] = vis["Entry"].apply(lambda x: ENTRY_EMOJI.get(x, x))
     vis["Signal"] = vis["Signal"].apply(lambda x: SIGNAL_EMOJI.get(x, x))
@@ -662,6 +668,14 @@ def formater_tabell(df, preset="Scan"):
     elif preset == "Breakout": cols = COLS_BREAKOUT
     else: cols = COLS_SCAN
     return vis[[c for c in cols if c in vis.columns]]
+
+
+# Shared column config: Selskap shows company name (extracted from URL fragment) and links to Nordnet
+SELSKAP_LINK = st.column_config.LinkColumn(
+    "Selskap",
+    help="Klikk for å åpne i Nordnet",
+    display_text=r"#(.+)$",  # extract name after the #
+)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -790,7 +804,8 @@ def main():
         st.info("Ingen aksjer matcher filtrene.")
     else:
         st.dataframe(formater_tabell(fd, preset), width="stretch", hide_index=True,
-                      height=min(len(fd)*38+40, 700))
+                      height=min(len(fd)*38+40, 700),
+                      column_config={"Selskap": SELSKAP_LINK})
         if len(fd)>0:
             tp = fd.iloc[0]
             st.caption(f"Topp: **{tp['Ticker']}** ({tp['Selskap']}) — {tp['Entry']} / {tp['Signal']} / Score {tp['Score']}")
@@ -812,7 +827,8 @@ def main():
     else:
         wd = df[df["Ticker"].isin(st.session_state.watchlist)].sort_values("Score",ascending=False)
         if wd.empty: st.warning("Ikke funnet i siste scan.")
-        else: st.dataframe(formater_tabell(wd, preset), width="stretch", hide_index=True)
+        else: st.dataframe(formater_tabell(wd, preset), width="stretch", hide_index=True,
+                            column_config={"Selskap": SELSKAP_LINK})
         nc = min(len(st.session_state.watchlist),8); fc2 = st.columns(nc)
         for i,tk in enumerate(sorted(st.session_state.watchlist)):
             with fc2[i%nc]:
