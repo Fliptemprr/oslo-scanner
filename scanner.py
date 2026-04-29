@@ -1,11 +1,8 @@
 """
-Oslo Børs Swing Trading Scanner – v4.1
-========================================
-296 aksjer · Entry Readiness · Trade Signal · Volume Trend
-Trend 1D · Support/Resistance · Late Move · Presets
-
-Refactored: named constants, split hent_data, fixed Trend 1H bug,
-atomic watchlist writes, better error logging.
+Oslo Børs Swing Trading Scanner – v5
+====================================
+Swing Scanner v5 — Pullback i trend
+Idégenerator for aksjer i positiv trend med rød/svak dag nær støtte.
 
 Kjør:  streamlit run scanner.py
 """
@@ -13,7 +10,7 @@ Kjør:  streamlit run scanner.py
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 import pandas as pd
-import numpy as np
+import numpy as np  # noqa: F401  (pre-existing import, kept)
 import yfinance as yf
 import json
 import time
@@ -46,44 +43,16 @@ HISTORY_DAYS = 300
 RETRY_DELAY_PER_TICKER = 2
 MIN_HISTORY_BARS = 50
 
-# Volume thresholds
-DEFAULT_MIN_AVG_VOLUME = 200_000
-MIN_TRADING_VOLUME = 500_000          # "ekte" likviditet for Entry Readiness
-VOL_RATIO_INCREASING = 1.5            # Vol Trend: Increasing
-VOL_RATIO_FLAT_MIN = 0.8              # Vol Trend: Flat lower bound
-VOL_RATIO_CONFIRMATION = 1.0          # BUY/WATCH krever dette
-VOL_RATIO_WATCH_MIN = 0.7             # WATCH min vol ratio
-VOL_RATIO_STRONG = 1.2                # Score +2 threshold
-
-# RSI
-RSI_OVERSOLD = 30                     # SKIP hvis under
-RSI_OVERBOUGHT = 75                   # EXTENDED hvis over
-RSI_READY_MIN, RSI_READY_MAX = 40, 60
-RSI_WAIT_MIN, RSI_WAIT_MAX = 35, 70
-RSI_SETUP_TREND_MIN, RSI_SETUP_TREND_MAX = 40, 70
-RSI_PULLBACK_MIN, RSI_PULLBACK_MAX = 35, 55
-RSI_EARLY_PB_MIN, RSI_EARLY_PB_MAX = 40, 50
-
-# SMA50 avstand (%)
-SMA50_READY_MIN, SMA50_READY_MAX = -2.0, 2.0
-SMA50_WAIT_MIN, SMA50_WAIT_MAX = -5.0, 5.0
-SMA50_PULLBACK_MIN, SMA50_PULLBACK_MAX = -2.0, 1.0
-SMA50_EXTENDED_PCT = 8.0              # EXTENDED hvis >8% over SMA50
-SMA50_BREAKOUT_MAX = 5.0              # Breakout: maks så langt over SMA50
-SMA50_NEAR_HIGH_PCT = 5.0             # EXTENDED: nær 20d high OG >5% over SMA50
-SMA50_SCORE_NEAR = 2.0                # Score +2 hvis innenfor ±2%
-
-# 20d high
-DIST_HIGH_NEAR_HIGH = -1.0            # innenfor 1% av high
-DIST_HIGH_BREAKOUT = -2.0             # Breakout: innenfor 2% av high
-
-# Trend 1H proxy
-TREND_1H_UP_THRESHOLD = 1.002         # +0.2% over dagens åpning
-TREND_1H_DOWN_THRESHOLD = 0.998       # -0.2% under dagens åpning
-
-# Score
-SCORE_MAX = 10
-MOMENTUM_PCT_MIN = 0.5                # % i dag for Momentum-setup
+# v5 thresholds
+V5_MIN_AVG_VOLUME = 500_000
+V5_RSI_EXTENDED = 70
+V5_DIST_SMA50_EXTENDED = 6.0
+V5_DAY_CHANGE_EXTENDED = 2.0
+V5_PRIME_SUPPORT_MAX = 4.0
+V5_PRIME_RESISTANCE_MIN = 3.0
+V5_SECONDARY_SUPPORT_MAX = 8.0
+V5_SECONDARY_RESISTANCE_MIN = 4.0
+V5_RANGE_MIN_BUILDER = 6.0
 
 OSLO_TICKERS = {
     "2020.OL": "2020 Bulkers",
@@ -397,9 +366,6 @@ def beregn_rsi(serie: pd.Series, periode: int = 14) -> pd.Series:
     rs = avg_g / avg_t
     return 100.0 - (100.0 / (1.0 + rs))
 
-# ──────────────────────────────────────────────────────────────
-# DATAHENTING (curl_cffi + batch + retry)
-# ──────────────────────────────────────────────────────────────
 
 # ──────────────────────────────────────────────────────────────
 # HELPERS
@@ -468,7 +434,7 @@ def _retry_missing(missing: list, session, start, end) -> dict:
 
 
 def _compute_metrics(ticker: str, df: pd.DataFrame, ticker_dict: dict) -> Optional[dict]:
-    """Beregn alle indikatorer for én aksje. Returner None hvis data er utilstrekkelig."""
+    """Beregn alle v5-indikatorer for én aksje. Returner None hvis data er utilstrekkelig."""
     try:
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
@@ -480,102 +446,102 @@ def _compute_metrics(ticker: str, df: pd.DataFrame, ticker_dict: dict) -> Option
         if len(close) < MIN_HISTORY_BARS:
             return None
 
-        # ── Kursdata ──
         price = float(close.iloc[-1])
         prev_close = float(close.iloc[-2]) if len(close) >= 2 else price
-        day_low = float(low.iloc[-1])
-        # Fix: bruk ekte dagens åpning, ikke forrige close
-        day_open = float(df["Open"].iloc[-1]) if "Open" in df.columns else prev_close
 
-        # ── Moving averages & RSI ──
-        sma200 = float(close.iloc[-200:].mean()) if len(close) >= 200 else None
+        # Moving averages & RSI
+        sma20 = float(close.iloc[-20:].mean()) if len(close) >= 20 else None
         sma50 = float(close.iloc[-50:].mean()) if len(close) >= 50 else None
+        sma200 = float(close.iloc[-200:].mean()) if len(close) >= 200 else None
         rsi = float(beregn_rsi(close, 14).iloc[-1]) if len(close) >= 20 else None
 
-        # ── Volum ──
+        # Volume
         vol_today = float(vol.iloc[-1])
         avg_vol = float(vol.tail(20).mean())
         vol_ratio = round(vol_today / avg_vol, 2) if avg_vol > 0 else 0.0
 
-        # ── Avstander ──
-        pct_change = safe_pct(price, prev_close) or 0.0
-        over200 = price > sma200 if sma200 is not None else None
-        over50 = price > sma50 if sma50 is not None else None
-        dist_sma50 = safe_pct(price, sma50)
+        # Day change %
+        pct_change = safe_pct(price, prev_close)
+        if pct_change is None:
+            pct_change = 0.0
 
+        # Distances to SMAs
+        dist_sma20 = safe_pct(price, sma20)
+        dist_sma50 = safe_pct(price, sma50)
+        dist_sma200 = safe_pct(price, sma200)
+
+        # 20D high/low/range
         high_20d = float(high.tail(20).max())
         low_20d = float(low.tail(20).min())
-        dist_high = safe_pct(price, high_20d) or 0.0
-        dist_low = safe_pct(price, low_20d) or 0.0
+        range_20d = round(((high_20d - low_20d) / low_20d) * 100, 2) if low_20d > 0 else None
 
-        # ── Late Move % ──
-        late_move = safe_pct(price, day_low) or 0.0
+        # Distance to 20D high/low (v5 def: positive when below high / above low)
+        dist_20d_high = round(((high_20d - price) / price) * 100, 2) if price > 0 else None
+        dist_20d_low = round(((price - low_20d) / low_20d) * 100, 2) if low_20d > 0 else None
 
-        # ── Distance to Support % (nærmeste av SMA50 / 20d low under kurs) ──
+        # Support: max of {SMA20, SMA50, 20D low} where candidate ≤ price
         support_candidates = []
-        if sma50 is not None and sma50 < price:
+        if sma20 is not None and sma20 <= price:
+            support_candidates.append(sma20)
+        if sma50 is not None and sma50 <= price:
             support_candidates.append(sma50)
-        if low_20d < price:
+        if low_20d <= price:
             support_candidates.append(low_20d)
         if support_candidates:
             nearest_support = max(support_candidates)
-            dist_support = round(((price - nearest_support) / price) * 100, 2)
+            support_pct = round(((price - nearest_support) / nearest_support) * 100, 2)
         else:
-            dist_support = None
+            support_pct = None
 
-        # ── Distance to Resistance % ──
-        dist_resistance = round(((high_20d - price) / price) * 100, 2) if high_20d > 0 else None
+        # Resistance: 20D high
+        resistance_pct = round(((high_20d - price) / price) * 100, 2) if price > 0 else None
 
-        # ── Volume Trend ──
-        if vol_ratio >= VOL_RATIO_INCREASING:
-            vol_trend = "Increasing"
-        elif vol_ratio >= VOL_RATIO_FLAT_MIN:
-            vol_trend = "Flat"
-        else:
-            vol_trend = "Decreasing"
+        # 3D / 5D change %
+        change_3d = safe_pct(price, float(close.iloc[-4])) if len(close) >= 4 else None
+        change_5d = safe_pct(price, float(close.iloc[-6])) if len(close) >= 6 else None
 
-        # ── Trend 1D ──
-        if over200 and over50:
-            trend_1d = "UP"
-        elif over200 is False:
-            trend_1d = "DOWN"
-        else:
-            trend_1d = "NEUTRAL"
-
-        # ── Trend 1H (proxy: kurs vs dagens åpning ±0.2%, med SMA50-bekreftelse) ──
-        if day_open > 0:
-            if price > day_open * TREND_1H_UP_THRESHOLD and (sma50 is None or price > sma50):
-                trend_1h = "UP"
-            elif price < day_open * TREND_1H_DOWN_THRESHOLD:
-                trend_1h = "DOWN"
-            else:
-                trend_1h = "NEUTRAL"
-        else:
-            trend_1h = "NEUTRAL"
+        # Candles last 5 days
+        candles = ""
+        last5 = df.tail(5)
+        if "Open" in df.columns:
+            for _, row in last5.iterrows():
+                o = row.get("Open")
+                c = row.get("Close")
+                if pd.isna(o) or pd.isna(c):
+                    candles += "⚪"
+                elif c > o:
+                    candles += "🟢"
+                elif c < o:
+                    candles += "🔴"
+                else:
+                    candles += "⚪"
 
         return {
             "Ticker": ticker.replace(".OL", ""),
             "ticker_yf": ticker,
-            "Selskap": ticker_dict.get(ticker, ticker),
+            "Navn": ticker_dict.get(ticker, ticker),
             "Kurs": round(price, 2),
             "% i dag": pct_change,
-            "SMA 200": round(sma200, 2) if sma200 else None,
-            "Over SMA200": over200,
-            "SMA 50": round(sma50, 2) if sma50 else None,
-            "Over SMA50": over50,
-            "Avst SMA50 %": dist_sma50,
-            "RSI 14": round(rsi, 1) if rsi else None,
             "Volum": int(vol_today),
-            "Snitt Vol 20d": int(avg_vol),
+            "Snittvolum 20D": int(avg_vol),
             "Vol Ratio": vol_ratio,
-            "Avst 20d High %": dist_high,
-            "Avst 20d Low %": dist_low,
-            "Late Move %": late_move,
-            "Støtte %": dist_support,
-            "Motstand %": dist_resistance,
-            "Vol Trend": vol_trend,
-            "Trend 1D": trend_1d,
-            "Trend 1H": trend_1h,
+            "SMA20": round(sma20, 2) if sma20 else None,
+            "SMA50": round(sma50, 2) if sma50 else None,
+            "SMA200": round(sma200, 2) if sma200 else None,
+            "Avst SMA20 %": dist_sma20,
+            "Avst SMA50 %": dist_sma50,
+            "Avst SMA200 %": dist_sma200,
+            "RSI 14": round(rsi, 1) if rsi else None,
+            "20D High": round(high_20d, 2),
+            "20D Low": round(low_20d, 2),
+            "20D Range %": range_20d,
+            "Avst 20D High %": dist_20d_high,
+            "Avst 20D Low %": dist_20d_low,
+            "Støtte %": support_pct,
+            "Motstand %": resistance_pct,
+            "3D %": change_3d,
+            "5D %": change_5d,
+            "Candles 5D": candles,
         }
     except Exception as e:
         log.warning(f"[{ticker}] compute failed: {type(e).__name__}: {e}")
@@ -594,7 +560,7 @@ def _lag_session():
 
 @st.cache_data(ttl=600, show_spinner=False)
 def hent_data(ticker_dict: dict) -> pd.DataFrame:
-    """Last ned historikk for alle aksjer og beregn indikatorer."""
+    """Last ned historikk for alle aksjer og beregn v5-indikatorer."""
     tickers_liste = list(ticker_dict.keys())
     start = datetime.now() - timedelta(days=HISTORY_DAYS)
     end = datetime.now()
@@ -637,184 +603,138 @@ def hent_data(ticker_dict: dict) -> pd.DataFrame:
         return pd.DataFrame()
 
     df_r = pd.DataFrame(resultater)
-    df_r = klassifiser_setup(df_r)
-    df_r = beregn_entry_readiness(df_r)
-    df_r = beregn_score(df_r)
+    df_r = compute_v5_status(df_r)
     return df_r
 
 
 # ──────────────────────────────────────────────────────────────
-# SETUP-KLASSIFISERING (v3 — unchanged)
+# V5 STATUS / VIEWS / SORT / FORMAT
 # ──────────────────────────────────────────────────────────────
 
-def klassifiser_setup(df: pd.DataFrame) -> pd.DataFrame:
-    """Klassifiser hver aksje som en setup-type."""
-    setups = []
+def compute_v5_status(df: pd.DataFrame) -> pd.DataFrame:
+    """Status-rekkefølge: EXTENDED → PRIME → SECONDARY → SKIP."""
+    statuses = []
     for _, r in df.iterrows():
-        over200 = r.get("Over SMA200")
-        over50 = r.get("Over SMA50")
         rsi = r.get("RSI 14")
         dist_sma50 = r.get("Avst SMA50 %")
-        dist_high = r.get("Avst 20d High %")
-        vol_ratio = r.get("Vol Ratio", 0)
-        pct_today = r.get("% i dag", 0)
+        day_change = r.get("% i dag")
+        sma50 = r.get("SMA50")
+        sma200 = r.get("SMA200")
+        kurs = r.get("Kurs")
+        support_pct = r.get("Støtte %")
+        resistance_pct = r.get("Motstand %")
 
-        if over200 is None or rsi is None or dist_sma50 is None:
-            setups.append("No setup")
+        # 1. EXTENDED (precedence)
+        if (rsi is not None and rsi > V5_RSI_EXTENDED) \
+                or (dist_sma50 is not None and dist_sma50 > V5_DIST_SMA50_EXTENDED) \
+                or (day_change is not None and day_change > V5_DAY_CHANGE_EXTENDED):
+            statuses.append("EXTENDED")
             continue
 
-        # Extended: fanges først (dårlige entries)
-        if rsi > RSI_OVERBOUGHT or (over200 and dist_sma50 > SMA50_EXTENDED_PCT):
-            setups.append("Extended")
+        in_trend = (
+            sma200 is not None and kurs is not None and kurs > sma200
+            and sma50 is not None and kurs > sma50
+        )
+
+        # 2. PRIME
+        if (in_trend
+                and day_change is not None and day_change <= 0
+                and support_pct is not None and 0 <= support_pct <= V5_PRIME_SUPPORT_MAX
+                and resistance_pct is not None and resistance_pct >= V5_PRIME_RESISTANCE_MIN):
+            statuses.append("PRIME")
             continue
 
-        # Breakout: nær 20d high + sterkt volum + IKKE for langt over SMA50
-        if (over200
-                and dist_high is not None and dist_high >= DIST_HIGH_BREAKOUT
-                and vol_ratio >= VOL_RATIO_INCREASING
-                and rsi > 50
-                and dist_sma50 <= SMA50_BREAKOUT_MAX):
-            setups.append("Breakout")
+        # 3. SECONDARY
+        if (in_trend
+                and day_change is not None and day_change <= 0
+                and support_pct is not None and V5_PRIME_SUPPORT_MAX < support_pct <= V5_SECONDARY_SUPPORT_MAX
+                and resistance_pct is not None and resistance_pct >= V5_SECONDARY_RESISTANCE_MIN):
+            statuses.append("SECONDARY")
             continue
 
-        # Pullback: nær SMA50 + kontrollert tilbaketrekking
-        if (over200
-                and SMA50_PULLBACK_MIN <= dist_sma50 <= SMA50_PULLBACK_MAX
-                and RSI_PULLBACK_MIN <= rsi <= RSI_PULLBACK_MAX):
-            setups.append("Pullback")
-            continue
+        # 4. SKIP
+        statuses.append("SKIP")
 
-        # Early Pullback: samme som Pullback men vol < 1 (forkant)
-        if (over200
-                and SMA50_PULLBACK_MIN <= dist_sma50 <= SMA50_PULLBACK_MAX
-                and RSI_EARLY_PB_MIN <= rsi <= RSI_EARLY_PB_MAX
-                and vol_ratio < VOL_RATIO_CONFIRMATION):
-            setups.append("Early Pullback")
-            continue
-
-        # Momentum: sterk dag + volum
-        if (over200 and over50
-                and pct_today > MOMENTUM_PCT_MIN
-                and vol_ratio >= VOL_RATIO_CONFIRMATION
-                and rsi > 50):
-            setups.append("Momentum")
-            continue
-
-        # Trend: stabil over begge SMA
-        if over200 and over50 and RSI_SETUP_TREND_MIN <= rsi <= RSI_SETUP_TREND_MAX:
-            setups.append("Trend")
-            continue
-
-        setups.append("No setup")
-
-    df["Setup"] = setups
+    df["Status"] = statuses
     return df
 
 
-# ──────────────────────────────────────────────────────────────
-# ENTRY READINESS (READY / WAIT / EXTENDED / SKIP)
-# ──────────────────────────────────────────────────────────────
-
-def beregn_entry_readiness(df: pd.DataFrame) -> pd.DataFrame:
-    """Beregn Entry Readiness (READY/WAIT/EXTENDED/SKIP) og Trade Signal."""
-    readiness_list = []
-    signals = []
-
-    for _, r in df.iterrows():
-        over200 = r.get("Over SMA200")
-        rsi = r.get("RSI 14")
-        dist_sma50 = r.get("Avst SMA50 %")
-        dist_high = r.get("Avst 20d High %")
-        vol_ratio = r.get("Vol Ratio", 0)
-        avg_vol = r.get("Snitt Vol 20d", 0)
-
-        # ── Entry Readiness (eksakt regelrekkefølge) ──
-
-        # 1. SKIP
-        if (over200 is False
-                or avg_vol < MIN_TRADING_VOLUME
-                or (rsi is not None and rsi < RSI_OVERSOLD)):
-            readiness = "SKIP"
-
-        # 2. EXTENDED: for langt opp eller overkjøpt
-        # "dist_high > DIST_HIGH_NEAR_HIGH" betyr innenfor 1% av 20d high
-        elif ((dist_sma50 is not None and dist_sma50 > SMA50_EXTENDED_PCT)
-              or (rsi is not None and rsi > RSI_OVERBOUGHT)
-              or (dist_high is not None and dist_high > DIST_HIGH_NEAR_HIGH
-                  and dist_sma50 is not None and dist_sma50 > SMA50_NEAR_HIGH_PCT)):
-            readiness = "EXTENDED"
-
-        # 3. READY: optimal entry-sone
-        elif (over200 is True
-              and dist_sma50 is not None and SMA50_READY_MIN <= dist_sma50 <= SMA50_READY_MAX
-              and rsi is not None and RSI_READY_MIN <= rsi <= RSI_READY_MAX
-              and vol_ratio >= VOL_RATIO_CONFIRMATION
-              and avg_vol >= MIN_TRADING_VOLUME):
-            readiness = "READY"
-
-        # 4. WAIT: bredere aksept-sone
-        elif (over200 is True
-              and dist_sma50 is not None and SMA50_WAIT_MIN <= dist_sma50 <= SMA50_WAIT_MAX
-              and rsi is not None and RSI_WAIT_MIN <= rsi <= RSI_WAIT_MAX
-              and avg_vol >= MIN_TRADING_VOLUME):
-            readiness = "WAIT"
-
-        # 5. else SKIP
-        else:
-            readiness = "SKIP"
-
-        # ── Trade Signal ──
-        if readiness == "READY" and vol_ratio >= VOL_RATIO_CONFIRMATION:
-            signal = "BUY"
-        elif readiness == "WAIT" and vol_ratio >= VOL_RATIO_WATCH_MIN:
-            signal = "WATCH"
-        elif readiness == "WAIT":
-            signal = "WAIT"
-        else:
-            signal = "SKIP"
-
-        readiness_list.append(readiness)
-        signals.append(signal)
-
-    df["Entry"] = readiness_list
-    df["Signal"] = signals
-    return df
+def apply_v5_view_filter(df: pd.DataFrame, view: str, min_avg_vol: int) -> pd.DataFrame:
+    """Filtrer DataFrame for valgt visning."""
+    if df.empty:
+        return df
+    f = df.copy()
+    in_trend = (
+        f["SMA200"].notna() & (f["Kurs"] > f["SMA200"])
+        & f["SMA50"].notna() & (f["Kurs"] > f["SMA50"])
+    )
+    if view == "Today Pullback":
+        f = f[in_trend & (f["Snittvolum 20D"] >= min_avg_vol) & (f["% i dag"] <= 0)]
+    elif view == "Watchlist Builders":
+        f = f[in_trend & (f["Snittvolum 20D"] >= min_avg_vol)
+              & f["20D Range %"].notna() & (f["20D Range %"] >= V5_RANGE_MIN_BUILDER)]
+    elif view == "Extended / Wait":
+        cond_ext = (
+            (f["RSI 14"].notna() & (f["RSI 14"] > V5_RSI_EXTENDED))
+            | (f["Avst SMA50 %"].notna() & (f["Avst SMA50 %"] > V5_DIST_SMA50_EXTENDED))
+            | (f["% i dag"].notna() & (f["% i dag"] > V5_DAY_CHANGE_EXTENDED))
+        )
+        f = f[in_trend & cond_ext]
+    return f
 
 
-# ──────────────────────────────────────────────────────────────
-# TRADE SCORE (0–10)
-# ──────────────────────────────────────────────────────────────
+def sort_v5(df: pd.DataFrame, view: str) -> pd.DataFrame:
+    """Sorter etter visning."""
+    if df.empty:
+        return df
+    f = df.copy()
+    if view == "Today Pullback":
+        order = {"PRIME": 0, "SECONDARY": 1, "EXTENDED": 2, "SKIP": 3}
+        f["_rank"] = f["Status"].map(order).fillna(99)
+        f = f.sort_values(
+            ["_rank", "Støtte %", "Motstand %"],
+            ascending=[True, True, False]
+        ).drop(columns=["_rank"])
+    elif view == "Watchlist Builders":
+        f = f.sort_values(["Støtte %", "Motstand %"], ascending=[True, False])
+    elif view == "Extended / Wait":
+        f = f.sort_values(["Avst SMA50 %", "RSI 14"], ascending=[False, False])
+    return f.reset_index(drop=True)
 
-def beregn_score(df: pd.DataFrame) -> pd.DataFrame:
-    """Trade Score 0–10 basert på entry timing + volumbekreftelse."""
-    scores = []
-    for _, r in df.iterrows():
-        p = 0
-        if r.get("Over SMA200"):
-            p += 2
-        if r.get("Over SMA50"):
-            p += 1
 
-        dist_sma50 = r.get("Avst SMA50 %")
-        if dist_sma50 is not None and -SMA50_SCORE_NEAR <= dist_sma50 <= SMA50_SCORE_NEAR:
-            p += 2
+STATUS_EMOJI = {
+    "PRIME": "🟢 PRIME",
+    "SECONDARY": "🟡 SECONDARY",
+    "EXTENDED": "🟠 EXTENDED",
+    "SKIP": "⚫ SKIP",
+}
 
-        rsi = r.get("RSI 14")
-        if rsi is not None and RSI_READY_MIN <= rsi <= RSI_READY_MAX:
-            p += 1
+V5_DISPLAY_COLS = [
+    "Ticker", "Navn", "Kurs", "% i dag",
+    "Volum", "Snittvolum 20D", "Vol Ratio",
+    "SMA20", "SMA50", "SMA200",
+    "Avst SMA20 %", "Avst SMA50 %", "Avst SMA200 %",
+    "RSI 14",
+    "20D High", "20D Low", "20D Range %",
+    "Avst 20D High %", "Avst 20D Low %",
+    "Støtte %", "Motstand %",
+    "3D %", "5D %", "Candles 5D",
+    "Status",
+]
 
-        vol_ratio = r.get("Vol Ratio", 0)
-        if vol_ratio > VOL_RATIO_STRONG:
-            p += 2
-        elif vol_ratio > VOL_RATIO_CONFIRMATION:
-            p += 1
 
-        if r.get("Snitt Vol 20d", 0) > MIN_TRADING_VOLUME:
-            p += 1
-
-        scores.append(max(0, min(p, SCORE_MAX)))
-    df["Score"] = scores
-    return df
+def format_v5_table(df: pd.DataFrame) -> pd.DataFrame:
+    """Formater for visning. Klikkbar Navn-link, Status med emoji, volum med mellomrom."""
+    vis = df.copy()
+    # Yahoo Finance link med #navn fragment så LinkColumn viser navn som linktekst
+    vis["Navn"] = vis.apply(
+        lambda r: f"https://finance.yahoo.com/quote/{r['ticker_yf']}#{r['Navn']}",
+        axis=1,
+    )
+    vis["Status"] = vis["Status"].apply(lambda x: STATUS_EMOJI.get(x, x))
+    vis["Volum"] = vis["Volum"].apply(lambda x: f"{x:,.0f}".replace(",", " "))
+    vis["Snittvolum 20D"] = vis["Snittvolum 20D"].apply(lambda x: f"{x:,.0f}".replace(",", " "))
+    return vis[[c for c in V5_DISPLAY_COLS if c in vis.columns]]
 
 
 # ──────────────────────────────────────────────────────────────
@@ -848,92 +768,61 @@ def lagre_watchlist(tickers: set) -> None:
 
 
 # ──────────────────────────────────────────────────────────────
-# VISNING
+# UI HELPERS
 # ──────────────────────────────────────────────────────────────
 
-SETUP_EMOJI = {"Trend":"🟢","Pullback":"🟡","Breakout":"🔵","Early Pullback":"🟠",
-               "Momentum":"🟣","Extended":"🔴","No setup":"⚪"}
-
-ENTRY_EMOJI = {"READY":"🟢 READY","WAIT":"🟡 WAIT","EXTENDED":"🔴 EXTENDED","SKIP":"⚪ SKIP"}
-SIGNAL_EMOJI = {"BUY":"🟢 BUY","WATCH":"🟡 WATCH","WAIT":"🟠 WAIT","SKIP":"🔴 SKIP"}
-TREND_EMOJI = {"UP":"🟢 UP","DOWN":"🔴 DOWN","NEUTRAL":"⚪ —"}
-VOL_TREND_EMOJI = {"Increasing":"🟩 Inc","Flat":"⬜ Flat","Decreasing":"🟥 Dec"}
-
-# Column sets for presets
-COLS_SCAN = [
-    "Signal","Entry","Ticker","Selskap","Kurs","% i dag",
-    "Trend 1D","RSI 14","Vol Ratio","Vol Trend","Setup","Score",
-]
-COLS_ENTRY = [
-    "Signal","Entry","Ticker","Selskap","Kurs","Avst SMA50 %",
-    "RSI 14","Vol Ratio","Vol Trend","Trend 1D","Trend 1H",
-    "Støtte %","Motstand %","Late Move %","Setup","Score",
-]
-COLS_BREAKOUT = [
-    "Signal","Entry","Ticker","Selskap","Kurs","% i dag",
-    "Avst 20d High %","Vol Ratio","Vol Trend","Trend 1D","Trend 1H",
-    "Motstand %","Late Move %","RSI 14","Setup","Score",
-]
-
-def formater_tabell(df: pd.DataFrame, preset: str = "Scan") -> pd.DataFrame:
-    """Formater DataFrame for visning, med emojis, linker og preset-spesifikke kolonner."""
-    vis = df.copy()
-    # Yahoo Finance direktelink — fungerer direkte med ticker (f.eks. EQNR.OL).
-    # Selskapsnavn embeds som #fragment slik at LinkColumn regex viser navnet som linktekst.
-    vis["Selskap"] = vis.apply(
-        lambda r: f"https://finance.yahoo.com/quote/{r['ticker_yf']}#{r['Selskap']}",
-        axis=1,
-    )
-    vis["Setup"] = vis["Setup"].apply(lambda x: f"{SETUP_EMOJI.get(x, '')} {x}")
-    vis["Entry"] = vis["Entry"].apply(lambda x: ENTRY_EMOJI.get(x, x))
-    vis["Signal"] = vis["Signal"].apply(lambda x: SIGNAL_EMOJI.get(x, x))
-    vis["Trend 1D"] = vis["Trend 1D"].apply(lambda x: TREND_EMOJI.get(x, x))
-    vis["Trend 1H"] = vis["Trend 1H"].apply(lambda x: TREND_EMOJI.get(x, x))
-    vis["Vol Trend"] = vis["Vol Trend"].apply(lambda x: VOL_TREND_EMOJI.get(x, x))
-    if "Over SMA200" in vis.columns:
-        vis["Over SMA200"] = vis["Over SMA200"].apply(lambda x: "✅" if x else ("❌" if x is False else "—"))
-    if "Over SMA50" in vis.columns:
-        vis["Over SMA50"] = vis["Over SMA50"].apply(lambda x: "✅" if x else ("❌" if x is False else "—"))
-    vis["Vol Ratio"] = vis["Vol Ratio"].apply(
-        lambda x: f"{'🟩 ' if x >= VOL_RATIO_INCREASING else ''}{x:.1f}x"
-    )
-    vis["Volum"] = vis["Volum"].apply(lambda x: f"{x:,.0f}".replace(",", " "))
-    vis["Snitt Vol 20d"] = vis["Snitt Vol 20d"].apply(lambda x: f"{x:,.0f}".replace(",", " "))
-
-    if preset == "Entry":
-        cols = COLS_ENTRY
-    elif preset == "Breakout":
-        cols = COLS_BREAKOUT
-    else:
-        cols = COLS_SCAN
-    return vis[[c for c in cols if c in vis.columns]]
-
-
-# Shared column config: Selskap shows company name (extracted from URL fragment) and links to Nordnet
-SELSKAP_LINK = st.column_config.LinkColumn(
-    "Selskap",
-    help="Klikk for å åpne i Nordnet",
-    display_text=r"#(.+)$",  # extract name after the #
+NAVN_LINK = st.column_config.LinkColumn(
+    "Navn",
+    help="Klikk for å åpne i Yahoo Finance",
+    display_text=r"#(.+)$",
 )
 
 
-# ──────────────────────────────────────────────────────────────
-# FILTER DEFAULTS
-# ──────────────────────────────────────────────────────────────
+def _vis_metrics(view_df: pd.DataFrame) -> None:
+    """Vis metric cards for valgt visning."""
+    n = len(view_df)
+    sup_vals = view_df["Støtte %"].dropna() if n else pd.Series(dtype=float)
+    res_vals = view_df["Motstand %"].dropna() if n else pd.Series(dtype=float)
 
-FILTER_DEFAULTS = {
-    "f_pullback":False,"f_early_pullback":False,"f_breakout":False,"f_trend":False,
-    "f_momentum":False,"f_extended":False,"f_no_setup":False,"f_skjul_extended":True,
-    "f_signal":"Alle","f_readiness":"Alle",
-    "f_over_sma200":False,"f_over_sma50":False,"f_rsi":(20,80),
-    "f_avst_sma50":(-15.0,15.0),"f_kun_hoyt_volum":False,"f_min_vol_ratio":0.0,
-    "f_min_vol":DEFAULT_MIN_AVG_VOLUME,"f_min_score":0,"f_preset":"Scan",
-}
+    c = st.columns(7)
+    c[0].metric("Kandidater", n)
+    c[1].metric("🟢 PRIME", int((view_df["Status"] == "PRIME").sum()) if n else 0)
+    c[2].metric("🟡 SECONDARY", int((view_df["Status"] == "SECONDARY").sum()) if n else 0)
+    c[3].metric("🟠 EXTENDED", int((view_df["Status"] == "EXTENDED").sum()) if n else 0)
+    c[4].metric("Avg Støtte %", f"{sup_vals.mean():.1f}" if not sup_vals.empty else "—")
+    c[5].metric("Avg Motstand %", f"{res_vals.mean():.1f}" if not res_vals.empty else "—")
+    c[6].metric("Røde i dag", int((view_df["% i dag"] < 0).sum()) if n else 0)
 
-def reset_filtre() -> None:
-    """Tilbakestill alle filtre til default-verdier."""
-    for k, v in FILTER_DEFAULTS.items():
-        st.session_state[k] = v
+
+def _render_view(df: pd.DataFrame, view: str, min_avg_vol: int) -> None:
+    """Filtrer, sorter, vis metrics + tabell + watchlist-knapper for én visning."""
+    view_df = apply_v5_view_filter(df, view, min_avg_vol)
+    view_df = sort_v5(view_df, view)
+    _vis_metrics(view_df)
+
+    if view_df.empty:
+        st.info("Ingen kandidater i denne visningen.")
+        return
+
+    st.dataframe(
+        format_v5_table(view_df),
+        width="stretch",
+        hide_index=True,
+        height=min(len(view_df) * 38 + 40, 700),
+        column_config={"Navn": NAVN_LINK},
+    )
+
+    st.markdown("**Watchlist:**")
+    nc = min(len(view_df), 8)
+    wc = st.columns(nc)
+    for i, (_, r) in enumerate(view_df.iterrows()):
+        tk = r["Ticker"]
+        with wc[i % nc]:
+            iw = tk in st.session_state.watchlist
+            if st.button(f"{'⭐' if iw else '☆'} {tk}", key=f"wl_{view}_{tk}"):
+                st.session_state.watchlist.discard(tk) if iw else st.session_state.watchlist.add(tk)
+                lagre_watchlist(st.session_state.watchlist)
+                st.rerun()
 
 
 # ──────────────────────────────────────────────────────────────
@@ -942,186 +831,116 @@ def reset_filtre() -> None:
 
 def main() -> None:
     """Streamlit hovedapp."""
-    st.set_page_config(page_title="Oslo Børs Scanner",page_icon="📈",layout="wide")
-    st.title("📈 Oslo Børs Swing Trading Scanner")
+    st.set_page_config(page_title="Oslo Børs Scanner v5", page_icon="📈", layout="wide")
+    st.title("📈 Swing Scanner v5 — Pullback i trend")
+    st.caption("Idégenerator for aksjer i positiv trend med rød/svak dag nær støtte. Status er ikke kjøpssignal — kandidater må vurderes manuelt.")
 
-    refresh_opts = {"Av":0,"5 min":5,"10 min":10,"15 min":15,"30 min":30}
-    ct,cr = st.columns([3,1])
-    with ct: st.caption(f"Alle {len(OSLO_TICKERS)} aksjer — Entry Readiness · Trade Signal · Presets")
-    with cr: rv = st.selectbox("Auto-refresh",list(refresh_opts.keys()),index=3,label_visibility="collapsed")
+    refresh_opts = {"Av": 0, "5 min": 5, "10 min": 10, "15 min": 15, "30 min": 30}
+    ct, cr = st.columns([3, 1])
+    with ct:
+        st.caption(f"{len(OSLO_TICKERS)} aksjer på Oslo Børs")
+    with cr:
+        rv = st.selectbox("Auto-refresh", list(refresh_opts.keys()), index=3, label_visibility="collapsed")
     rm = refresh_opts[rv]
     if rm > 0:
-        t = st_autorefresh(interval=rm*60*1000,key="auto_refresh")
-        if t and t > 0: st.cache_data.clear()
+        t = st_autorefresh(interval=rm * 60 * 1000, key="auto_refresh")
+        if t and t > 0:
+            st.cache_data.clear()
 
-    if "watchlist" not in st.session_state: st.session_state.watchlist = last_watchlist()
-    if "data" not in st.session_state: st.session_state.data = None
-    for k,v in FILTER_DEFAULTS.items():
-        if k not in st.session_state: st.session_state[k] = v
+    if "watchlist" not in st.session_state:
+        st.session_state.watchlist = last_watchlist()
+    if "data" not in st.session_state:
+        st.session_state.data = None
 
     # ── Controls ──
     st.markdown("---")
-    cc1, cc2, cc3 = st.columns([1,1,1])
-    with cc1: scan = st.button("🔄 Scan nå",type="primary",width="stretch")
-    with cc2: st.button("🗑️ Reset filtre",on_click=reset_filtre,width="stretch")
-    with cc3: preset = st.selectbox("📋 Preset",["Scan","Entry","Breakout"],key="f_preset")
+    cc1, cc2 = st.columns([1, 2])
+    with cc1:
+        scan = st.button("🔄 Scan nå", type="primary", width="stretch")
+    with cc2:
+        min_avg_vol = st.number_input(
+            "Min Snittvolum 20D",
+            min_value=V5_MIN_AVG_VOLUME,
+            value=V5_MIN_AVG_VOLUME,
+            step=100_000,
+        )
 
     if scan:
-        st.cache_data.clear(); st.session_state.data = hent_data(OSLO_TICKERS)
+        st.cache_data.clear()
+        st.session_state.data = hent_data(OSLO_TICKERS)
         st.success(f"✅ Skannet {len(st.session_state.data)} aksjer")
     elif st.session_state.data is None:
         st.session_state.data = hent_data(OSLO_TICKERS)
 
     df = st.session_state.data
-    if df is None or df.empty: st.warning("Ingen data. Trykk «Scan nå»."); return
+    if df is None or df.empty:
+        st.warning("Ingen data. Trykk «Scan nå».")
+        return
 
-    # ── Setup filter ──
-    st.markdown("**Setup-filter:**")
-    sc = st.columns(7)
-    with sc[0]: cb_pullback = st.checkbox("🟡 Pullback", key="f_pullback")
-    with sc[1]: cb_early_pb = st.checkbox("🟠 Early PB", key="f_early_pullback")
-    with sc[2]: cb_breakout = st.checkbox("🔵 Breakout", key="f_breakout")
-    with sc[3]: cb_trend = st.checkbox("🟢 Trend", key="f_trend")
-    with sc[4]: cb_momentum = st.checkbox("🟣 Momentum", key="f_momentum")
-    with sc[5]: cb_extended = st.checkbox("🔴 Extended", key="f_extended")
-    with sc[6]: cb_no_setup = st.checkbox("⚪ No setup", key="f_no_setup")
-
-    # ── Filters ──
-    st.markdown("**Filtre:**")
-    fc = st.columns(4)
-    with fc[0]:
-        signal_filter = st.selectbox("📡 Signal", ["Alle","BUY","WATCH","WAIT","SKIP"], key="f_signal")
-        entry_filter = st.selectbox("🎯 Entry Readiness", ["Alle","READY","WAIT","EXTENDED","SKIP"], key="f_readiness")
-        hide_extended = st.checkbox("🚫 Skjul Extended", key="f_skjul_extended")
-    with fc[1]:
-        require_sma200 = st.checkbox("Kun over SMA 200", key="f_over_sma200")
-        require_sma50 = st.checkbox("Kun over SMA 50", key="f_over_sma50")
-        high_volume_only = st.checkbox("🔊 Kun høyt volum (>1x)", key="f_kun_hoyt_volum")
-        min_vol_ratio = st.slider("Min. Vol Ratio", 0.0, 5.0, step=0.1, key="f_min_vol_ratio")
-    with fc[2]:
-        rsi_range = st.slider("RSI-range", 0, 100, key="f_rsi")
-        dist_range = st.slider("Avstand SMA50 %", -30.0, 30.0, step=0.5, key="f_avst_sma50")
-    with fc[3]:
-        min_avg_vol = st.number_input("Min. snittvolum 20d", min_value=0, step=50_000, key="f_min_vol")
-        min_score = st.slider("Minimum score", 0, SCORE_MAX, key="f_min_score")
-
-    # ── Apply filters ──
-    fd = df.copy()
-    fd = fd[fd["Snitt Vol 20d"] >= min_avg_vol]
-    if signal_filter != "Alle":
-        fd = fd[fd["Signal"] == signal_filter]
-    if entry_filter != "Alle":
-        fd = fd[fd["Entry"] == entry_filter]
-
-    selected_setups = []
-    if cb_pullback: selected_setups.append("Pullback")
-    if cb_early_pb: selected_setups.append("Early Pullback")
-    if cb_breakout: selected_setups.append("Breakout")
-    if cb_trend: selected_setups.append("Trend")
-    if cb_momentum: selected_setups.append("Momentum")
-    if cb_extended: selected_setups.append("Extended")
-    if cb_no_setup: selected_setups.append("No setup")
-    if selected_setups:
-        fd = fd[fd["Setup"].isin(selected_setups)]
-
-    if hide_extended and not cb_extended:
-        fd = fd[fd["Setup"] != "Extended"]
-    if require_sma200:
-        fd = fd[fd["Over SMA200"] == True]
-    if require_sma50:
-        fd = fd[fd["Over SMA50"] == True]
-    if high_volume_only:
-        fd = fd[fd["Vol Ratio"] >= VOL_RATIO_CONFIRMATION]
-    if min_vol_ratio > 0:
-        fd = fd[fd["Vol Ratio"] >= min_vol_ratio]
-
-    fd = fd[fd["RSI 14"].notna() & (fd["RSI 14"] >= rsi_range[0]) & (fd["RSI 14"] <= rsi_range[1])]
-    fd = fd[fd["Avst SMA50 %"].notna() & (fd["Avst SMA50 %"] >= dist_range[0]) & (fd["Avst SMA50 %"] <= dist_range[1])]
-    fd = fd[fd["Score"] >= min_score]
-    fd = fd.sort_values("Score", ascending=False).reset_index(drop=True)
-
-    # ── Metrics ──
+    # ── Tabs ──
     st.markdown("---")
-    q = st.columns(7); n = len(fd)
-    q[0].metric("Kandidater",n)
-    q[1].metric("🟢 READY",len(fd[fd["Entry"]=="READY"]) if n else 0)
-    q[2].metric("🟢 BUY",len(fd[fd["Signal"]=="BUY"]) if n else 0)
-    q[3].metric("🟡 WATCH",len(fd[fd["Signal"]=="WATCH"]) if n else 0)
-    q[4].metric("Pullback",len(fd[fd["Setup"].isin(["Pullback","Early Pullback"])]) if n else 0)
-    q[5].metric("Breakout",len(fd[fd["Setup"]=="Breakout"]) if n else 0)
-    q[6].metric("Trend",len(fd[fd["Setup"]=="Trend"]) if n else 0)
-
-    # ── Table ──
-    if fd.empty:
-        st.info("Ingen aksjer matcher filtrene.")
-    else:
-        st.dataframe(formater_tabell(fd, preset), width="stretch", hide_index=True,
-                      height=min(len(fd)*38+40, 700),
-                      column_config={"Selskap": SELSKAP_LINK})
-        if len(fd)>0:
-            tp = fd.iloc[0]
-            st.caption(f"Topp: **{tp['Ticker']}** ({tp['Selskap']}) — {tp['Entry']} / {tp['Signal']} / Score {tp['Score']}")
-
-        # Watchlist buttons
-        st.markdown("**Watchlist:**")
-        nc = min(len(fd),8); wc = st.columns(nc)
-        for i,(_,r) in enumerate(fd.iterrows()):
-            tk = r["Ticker"]
-            with wc[i%nc]:
-                iw = tk in st.session_state.watchlist
-                if st.button(f"{'⭐' if iw else '☆'} {tk}",key=f"wl_{tk}"):
-                    st.session_state.watchlist.discard(tk) if iw else st.session_state.watchlist.add(tk)
-                    lagre_watchlist(st.session_state.watchlist); st.rerun()
+    tab1, tab2, tab3 = st.tabs([
+        "🟢 Today Pullback",
+        "📊 Watchlist Builders",
+        "🟠 Extended / Wait",
+    ])
+    with tab1:
+        _render_view(df, "Today Pullback", min_avg_vol)
+    with tab2:
+        _render_view(df, "Watchlist Builders", min_avg_vol)
+    with tab3:
+        _render_view(df, "Extended / Wait", min_avg_vol)
 
     # ── Watchlist ──
-    st.markdown("---"); st.subheader(f"⭐ Watchlist ({len(st.session_state.watchlist)})")
-    if not st.session_state.watchlist: st.info("Tom watchlist.")
+    st.markdown("---")
+    st.subheader(f"⭐ Watchlist ({len(st.session_state.watchlist)})")
+    if not st.session_state.watchlist:
+        st.info("Tom watchlist.")
     else:
-        wd = df[df["Ticker"].isin(st.session_state.watchlist)].sort_values("Score",ascending=False)
-        if wd.empty: st.warning("Ikke funnet i siste scan.")
-        else: st.dataframe(formater_tabell(wd, preset), width="stretch", hide_index=True,
-                            column_config={"Selskap": SELSKAP_LINK})
-        nc = min(len(st.session_state.watchlist),8); fc2 = st.columns(nc)
-        for i,tk in enumerate(sorted(st.session_state.watchlist)):
-            with fc2[i%nc]:
-                if st.button(f"❌ {tk}",key=f"rm_{tk}"):
-                    st.session_state.watchlist.discard(tk); lagre_watchlist(st.session_state.watchlist); st.rerun()
+        wd = df[df["Ticker"].isin(st.session_state.watchlist)]
+        if wd.empty:
+            st.warning("Ikke funnet i siste scan.")
+        else:
+            wd = sort_v5(wd, "Today Pullback")
+            st.dataframe(
+                format_v5_table(wd),
+                width="stretch",
+                hide_index=True,
+                column_config={"Navn": NAVN_LINK},
+            )
+        nc = min(len(st.session_state.watchlist), 8)
+        fc2 = st.columns(nc)
+        for i, tk in enumerate(sorted(st.session_state.watchlist)):
+            with fc2[i % nc]:
+                if st.button(f"❌ {tk}", key=f"rm_{tk}"):
+                    st.session_state.watchlist.discard(tk)
+                    lagre_watchlist(st.session_state.watchlist)
+                    st.rerun()
 
     # ── Footer ──
     st.markdown("---")
-    with st.expander("ℹ️ v4 — Entry Readiness, Signal, Presets"):
+    with st.expander("ℹ️ v5 — Status-regler"):
         st.markdown("""
-**Entry Readiness (rule order):**
+**Status-rekkefølge (EXTENDED → PRIME → SECONDARY → SKIP):**
+
 | Status | Regel |
 |--------|-------|
-| SKIP | Price < SMA200, avg vol < 500k, RSI < 30 |
-| EXTENDED | Dist SMA50 > 8%, RSI > 75, or near high + >5% over SMA50 |
-| READY | Over SMA200, SMA50 ±2%, RSI 40–60, vol ratio ≥1.0, avg vol ≥500k |
-| WAIT | Over SMA200, SMA50 ±5%, RSI 35–70, avg vol ≥500k |
+| 🟠 EXTENDED | RSI 14 > 70, eller Avst SMA50 > 6 %, eller % i dag > 2 % |
+| 🟢 PRIME | Over SMA200 og SMA50, % i dag ≤ 0, Støtte 0–4 %, Motstand ≥ 3 % |
+| 🟡 SECONDARY | Over SMA200 og SMA50, % i dag ≤ 0, Støtte 4–8 %, Motstand ≥ 4 % |
+| ⚫ SKIP | alt annet |
 
-**Trade Signal:**
-| Signal | Regel |
-|--------|-------|
-| 🟢 BUY | READY + vol ratio ≥ 1.0 |
-| 🟡 WATCH | WAIT + vol ratio ≥ 0.7 |
-| 🟠 WAIT | WAIT + vol ratio < 0.7 |
-| 🔴 SKIP | alt annet |
+**Visninger:**
+- **Today Pullback** — Hovedvisning. Trend + Snittvolum 20D ≥ 500k + % i dag ≤ 0. Sortert: status → Støtte ↑ → Motstand ↓.
+- **Watchlist Builders** — Trend + Snittvolum 20D ≥ 500k + 20D Range ≥ 6 %. Volatile aksjer for swing-tracking.
+- **Extended / Wait** — Aksjer i trend som er overstrukket. Vent på pullback.
 
-**New Columns:**
-- **Vol Trend** — Increasing (≥1.5x) / Flat / Decreasing (<0.8x)
-- **Trend 1D** — UP (over both SMA) / DOWN (under SMA200) / NEUTRAL
-- **Trend 1H** — UP/DOWN/NEUTRAL (approx from daily data)
-- **Støtte %** — distance to nearest support (SMA50 or 20d low)
-- **Motstand %** — distance to 20d high
-- **Late Move %** — how far price moved from day low
-
-**Presets:**
-- **Scan** — overview with Signal, Entry, Trend, Setup, Score
-- **Entry** — focus on SMA50 proximity, support/resistance, late move
-- **Breakout** — focus on 20d high distance, volume, momentum
+**Status er ikke kjøpssignal.** Det er en kandidat. Må vurderes manuelt.
         """)
 
-    oslo_tid = datetime.now(ZoneInfo("Europe/Oslo")).strftime('%Y-%m-%d %H:%M')
-    st.caption(f"Oppdatert: {oslo_tid} (Oslo) | {len(OSLO_TICKERS)} aksjer | v4")
+    oslo_tid = datetime.now(ZoneInfo("Europe/Oslo")).strftime("%Y-%m-%d %H:%M")
+    st.caption(f"Oppdatert: {oslo_tid} (Oslo) | {len(OSLO_TICKERS)} aksjer | Swing Scanner v5 — Pullback i trend")
 
-if __name__ == "__main__": main()
+
+if __name__ == "__main__":
+    main()
