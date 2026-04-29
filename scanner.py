@@ -45,13 +45,14 @@ MIN_HISTORY_BARS = 50
 
 # v5 thresholds
 V5_MIN_AVG_VOLUME = 500_000
-V5_RSI_EXTENDED = 70
-V5_DIST_SMA50_EXTENDED = 6.0
-V5_DAY_CHANGE_EXTENDED = 2.0
-V5_PRIME_SUPPORT_MAX = 4.0
-V5_PRIME_RESISTANCE_MIN = 3.0
-V5_SECONDARY_SUPPORT_MAX = 8.0
-V5_SECONDARY_RESISTANCE_MIN = 4.0
+V5_RSI_EXTENDED = 75
+V5_DIST_SMA50_EXTENDED = 8.0
+V5_DAY_CHANGE_EXTENDED = 3.0
+V5_PULLBACK_DAY_MAX = 0.5        # Today Pullback: maks daglig endring %
+V5_PRIME_SUPPORT_MAX = 5.0
+V5_PRIME_RESISTANCE_MIN = 2.0
+V5_SECONDARY_SUPPORT_MAX = 10.0
+V5_SECONDARY_RESISTANCE_MIN = 3.0
 V5_RANGE_MIN_BUILDER = 6.0
 
 OSLO_TICKERS = {
@@ -612,7 +613,7 @@ def hent_data(ticker_dict: dict) -> pd.DataFrame:
 # ──────────────────────────────────────────────────────────────
 
 def compute_v5_status(df: pd.DataFrame) -> pd.DataFrame:
-    """Status-rekkefølge: EXTENDED → PRIME → SECONDARY → SKIP."""
+    """Status-rekkefølge: PRIME → SECONDARY → EXTENDED → SKIP."""
     statuses = []
     for _, r in df.iterrows():
         rsi = r.get("RSI 14")
@@ -624,32 +625,32 @@ def compute_v5_status(df: pd.DataFrame) -> pd.DataFrame:
         support_pct = r.get("Støtte %")
         resistance_pct = r.get("Motstand %")
 
-        # 1. EXTENDED (precedence)
-        if (rsi is not None and rsi > V5_RSI_EXTENDED) \
-                or (dist_sma50 is not None and dist_sma50 > V5_DIST_SMA50_EXTENDED) \
-                or (day_change is not None and day_change > V5_DAY_CHANGE_EXTENDED):
-            statuses.append("EXTENDED")
-            continue
-
         in_trend = (
             sma200 is not None and kurs is not None and kurs > sma200
             and sma50 is not None and kurs > sma50
         )
 
-        # 2. PRIME
+        # 1. PRIME
         if (in_trend
-                and day_change is not None and day_change <= 0
+                and day_change is not None and day_change <= V5_PULLBACK_DAY_MAX
                 and support_pct is not None and 0 <= support_pct <= V5_PRIME_SUPPORT_MAX
                 and resistance_pct is not None and resistance_pct >= V5_PRIME_RESISTANCE_MIN):
             statuses.append("PRIME")
             continue
 
-        # 3. SECONDARY
+        # 2. SECONDARY
         if (in_trend
-                and day_change is not None and day_change <= 0
+                and day_change is not None and day_change <= V5_PULLBACK_DAY_MAX
                 and support_pct is not None and V5_PRIME_SUPPORT_MAX < support_pct <= V5_SECONDARY_SUPPORT_MAX
                 and resistance_pct is not None and resistance_pct >= V5_SECONDARY_RESISTANCE_MIN):
             statuses.append("SECONDARY")
+            continue
+
+        # 3. EXTENDED
+        if (rsi is not None and rsi > V5_RSI_EXTENDED) \
+                or (dist_sma50 is not None and dist_sma50 > V5_DIST_SMA50_EXTENDED) \
+                or (day_change is not None and day_change > V5_DAY_CHANGE_EXTENDED):
+            statuses.append("EXTENDED")
             continue
 
         # 4. SKIP
@@ -669,7 +670,7 @@ def apply_v5_view_filter(df: pd.DataFrame, view: str, min_avg_vol: int) -> pd.Da
         & f["SMA50"].notna() & (f["Kurs"] > f["SMA50"])
     )
     if view == "Today Pullback":
-        f = f[in_trend & (f["Snittvolum 20D"] >= min_avg_vol) & (f["% i dag"] <= 0)]
+        f = f[in_trend & (f["Snittvolum 20D"] >= min_avg_vol) & (f["% i dag"] <= V5_PULLBACK_DAY_MAX)]
     elif view == "Watchlist Builders":
         f = f[in_trend & (f["Snittvolum 20D"] >= min_avg_vol)
               & f["20D Range %"].notna() & (f["20D Range %"] >= V5_RANGE_MIN_BUILDER)]
@@ -921,17 +922,17 @@ def main() -> None:
     st.markdown("---")
     with st.expander("ℹ️ v5 — Status-regler"):
         st.markdown("""
-**Status-rekkefølge (EXTENDED → PRIME → SECONDARY → SKIP):**
+**Status-rekkefølge (PRIME → SECONDARY → EXTENDED → SKIP):**
 
 | Status | Regel |
 |--------|-------|
-| 🟠 EXTENDED | RSI 14 > 70, eller Avst SMA50 > 6 %, eller % i dag > 2 % |
-| 🟢 PRIME | Over SMA200 og SMA50, % i dag ≤ 0, Støtte 0–4 %, Motstand ≥ 3 % |
-| 🟡 SECONDARY | Over SMA200 og SMA50, % i dag ≤ 0, Støtte 4–8 %, Motstand ≥ 4 % |
+| 🟢 PRIME | Over SMA200 og SMA50, % i dag ≤ +0,5, Støtte 0–5 %, Motstand ≥ 2 % |
+| 🟡 SECONDARY | Over SMA200 og SMA50, % i dag ≤ +0,5, Støtte 5–10 %, Motstand ≥ 3 % |
+| 🟠 EXTENDED | RSI 14 > 75, eller Avst SMA50 > 8 %, eller % i dag > 3 % |
 | ⚫ SKIP | alt annet |
 
 **Visninger:**
-- **Today Pullback** — Hovedvisning. Trend + Snittvolum 20D ≥ 500k + % i dag ≤ 0. Sortert: status → Støtte ↑ → Motstand ↓.
+- **Today Pullback** — Hovedvisning. Trend + Snittvolum 20D ≥ 500k + % i dag ≤ +0,5. Sortert: PRIME → SECONDARY → EXTENDED → Støtte ↑ → Motstand ↓.
 - **Watchlist Builders** — Trend + Snittvolum 20D ≥ 500k + 20D Range ≥ 6 %. Volatile aksjer for swing-tracking.
 - **Extended / Wait** — Aksjer i trend som er overstrukket. Vent på pullback.
 
