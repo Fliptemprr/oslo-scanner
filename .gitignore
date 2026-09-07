@@ -1,0 +1,9 @@
+# Kjøretidsstate – skrives av appen, ikke kildekode
+watchlist.json
+fundamentals.json
+radar_state.json
+
+*.tmp
+__pycache__/
+*.pyc
+.venv/
