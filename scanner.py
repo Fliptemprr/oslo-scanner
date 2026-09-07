@@ -19,6 +19,7 @@ import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 import pandas as pd
 import numpy as np
+import altair as alt
 import yfinance as yf
 import html as html_lib
 import json
@@ -2090,6 +2091,137 @@ def tabell_fotnote(resultater: list) -> str:
 
 
 
+# ── Kursgraf ──────────────────────────────────────────────────
+# Paletten er validert mot mørk flate: lyshetsbånd, kromagulv,
+# fargeblindhets-separasjon (ΔE 24.5 protan) og kontrast, alle PASS.
+GRAF_INK = "#ECEEF2"      # kurs — hovedserien, blekkfarge
+GRAF_SMA50 = "#B5892F"    # rav
+GRAF_SMA200 = "#3585D6"   # blå
+GRAF_GRID = "#1A1E26"
+GRAF_FONT = "IBM Plex Mono, ui-monospace, Menlo, monospace"
+
+GRAF_VINDUER = {"KORREKSJON": None, "3M": 63, "6M": 126, "1Å": 252}
+
+
+def kursgraf(r: dict, vindu: str = "KORREKSJON"):
+    """
+    Kurs med SMA50 og SMA200, korreksjonsvinduet skyggelagt og topp/bunn
+    merket. Poenget er å vise korreksjonen radaren snakker om, ikke å være
+    et handelschart.
+    """
+    ind = r["ind"]
+    cc = r.get("currentCorrection")
+    n_bars = len(ind["close"])
+
+    if vindu == "KORREKSJON" and cc is not None:
+        n = min(n_bars, max(90, n_bars - cc.peakIdx + 40))
+    else:
+        n = min(n_bars, GRAF_VINDUER.get(vindu) or 126)
+
+    d = pd.DataFrame({
+        "Dato": ind["index"], "Kurs": ind["close"].to_numpy(),
+        "SMA50": ind["sma50_s"].to_numpy(), "SMA200": ind["sma200_s"].to_numpy(),
+    }).tail(n).dropna(subset=["Kurs"])
+    if len(d) < 5:
+        return None
+
+    lang = d.melt("Dato", var_name="Serie", value_name="Verdi").dropna(subset=["Verdi"])
+    lav, hoy = float(d["Kurs"].min()), float(d["Kurs"].max())
+    for kol in ("SMA50", "SMA200"):
+        if d[kol].notna().any():
+            lav = min(lav, float(d[kol].min()))
+            hoy = max(hoy, float(d[kol].max()))
+    marg = (hoy - lav) * 0.08 or 1.0
+
+    akse_x = alt.Axis(format="%b %y", tickCount=5, grid=False, domainColor=GRAF_GRID,
+                      tickColor=GRAF_GRID, labelColor="#6B7686", labelFontSize=9,
+                      labelFont=GRAF_FONT, title=None)
+    akse_y = alt.Axis(tickCount=4, gridColor=GRAF_GRID, gridWidth=1, domain=False,
+                      ticks=False, labelColor="#6B7686", labelFontSize=9,
+                      labelFont=GRAF_FONT, title=None, labelPadding=4)
+    skala_y = alt.Scale(domain=[lav - marg, hoy + marg])
+
+    lag = []
+
+    # Korreksjonsvinduet som svak skygge
+    if cc is not None and cc.peakIdx < n_bars:
+        topp_dato = pd.Timestamp(cc.peakDate)
+        if topp_dato >= d["Dato"].iloc[0]:
+            lag.append(
+                alt.Chart(pd.DataFrame({"start": [topp_dato], "slutt": [d["Dato"].iloc[-1]]}))
+                .mark_rect(color=STATUS_FARGE[r["status"]], opacity=0.07)
+                .encode(x="start:T", x2="slutt:T"))
+
+    lag.append(
+        alt.Chart(lang).mark_line(interpolate="monotone").encode(
+            x=alt.X("Dato:T", axis=akse_x, title=None),
+            y=alt.Y("Verdi:Q", scale=skala_y, axis=akse_y, title=None),
+            color=alt.Color("Serie:N", scale=alt.Scale(
+                domain=["Kurs", "SMA50", "SMA200"],
+                range=[GRAF_INK, GRAF_SMA50, GRAF_SMA200]),
+                legend=alt.Legend(orient="top", direction="horizontal", title=None,
+                                  labelColor="#8B95A5", labelFontSize=10,
+                                  labelFont=GRAF_FONT, symbolType="stroke",
+                                  symbolStrokeWidth=2, symbolSize=110, offset=2)),
+            strokeWidth=alt.StrokeWidth("Serie:N", scale=alt.Scale(
+                domain=["Kurs", "SMA50", "SMA200"], range=[2, 1.3, 1.3]), legend=None),
+            order=alt.Order("Serie:N", sort="descending"),
+        ))
+
+    # Topp og bunn direktemerket — de to punktene som definerer korreksjonen
+    if cc is not None:
+        merker = []
+        for etikett, dato, pris, farge in [
+            ("TOPP", cc.peakDate, cc.peakPrice, "#8B95A5"),
+            ("BUNN", cc.troughDate, cc.troughPrice, DC["roed"]),
+        ]:
+            ts = pd.Timestamp(dato)
+            if ts >= d["Dato"].iloc[0]:
+                # Ligger punktet nær høyre kant, snus etiketten innover
+                # så teksten ikke blir klippet av plottkanten.
+                spenn = (d["Dato"].iloc[-1] - d["Dato"].iloc[0]).days or 1
+                andel = (ts - d["Dato"].iloc[0]).days / spenn
+                merker.append({"Dato": ts, "Verdi": pris,
+                               "Etikett": f"{etikett} {pris:,.2f}".replace(",", " "),
+                               "Farge": farge,
+                               "Just": "right" if andel > 0.72 else "left",
+                               "Dx": -9 if andel > 0.72 else 9})
+        if merker:
+            m = pd.DataFrame(merker)
+            lag.append(alt.Chart(m).mark_point(size=48, filled=True, stroke=DC["rail"],
+                                               strokeWidth=2).encode(
+                x="Dato:T", y=alt.Y("Verdi:Q", scale=skala_y),
+                color=alt.Color("Farge:N", scale=None)))
+            # To tekstlag: align kan ikke være en feltkoding, så venstre- og
+            # høyrestilte etiketter tegnes hver for seg.
+            for just, dx in (("left", 9), ("right", -9)):
+                del_m = m[m["Just"] == just]
+                if not del_m.empty:
+                    lag.append(alt.Chart(del_m).mark_text(
+                        align=just, dx=dx, dy=-9, fontSize=9, font=GRAF_FONT).encode(
+                        x="Dato:T", y=alt.Y("Verdi:Q", scale=skala_y),
+                        text="Etikett:N", color=alt.Color("Farge:N", scale=None)))
+
+    # Hover: hårlinje og verdier for alle tre seriene
+    naerme = alt.selection_point(nearest=True, on="pointerover", fields=["Dato"], empty=False)
+    lag.append(
+        alt.Chart(d).mark_rule(color="#8B95A5", strokeWidth=1)
+        .encode(x="Dato:T",
+                opacity=alt.condition(naerme, alt.value(0.5), alt.value(0)),
+                tooltip=[alt.Tooltip("Dato:T", title="Dato", format="%d.%m.%Y"),
+                         alt.Tooltip("Kurs:Q", format=".2f"),
+                         alt.Tooltip("SMA50:Q", format=".2f"),
+                         alt.Tooltip("SMA200:Q", format=".2f")])
+        .add_params(naerme))
+
+    # configure_view må komme sist: et etterfølgende configure()-kall
+    # overskriver hele config-objektet og slukte stroke-innstillingen.
+    return (alt.layer(*lag).properties(height=190)
+            .configure(background=DC["rail"], font="IBM Plex Sans, sans-serif")
+            .configure_axis(domainWidth=0)
+            .configure_view(stroke=None, fill=DC["rail"], strokeWidth=0))
+
+
 def panel_topp_html(r: dict) -> str:
     """Høyrepanelets hode: ticker, badge, kurs og de tre scorebarene."""
     ind, cc = r["ind"], r.get("currentCorrection")
@@ -2466,6 +2598,16 @@ def _hoyrepanel(r: dict, fund_store: dict) -> bool:
     """Detaljpanelet. Returnerer True hvis fundamental-sjekken ble endret."""
     with st.container(key="panel"):
         st.html(panel_topp_html(r))
+
+        vindu = st.segmented_control("Vindu", list(GRAF_VINDUER.keys()),
+                                     default="KORREKSJON", key=f"graf_{r['ticker']}",
+                                     label_visibility="collapsed")
+        graf = kursgraf(r, vindu or "KORREKSJON")
+        if graf is not None:
+            st.altair_chart(graf, width="stretch", theme=None)
+        else:
+            st.html(f'<div style="font-size:12px;color:{DC["svak"]};padding:8px 0;">'
+                    f'For lite kursdata til å tegne graf.</div>')
 
         t1, t2, t3, t4 = st.tabs(["KRITERIER", "KORREKSJON", "HISTORIKK", "NØKKELTALL"])
         with t1:
