@@ -1722,11 +1722,16 @@ def _rgba(hex_farge: str, alpha: float) -> str:
 # ══════════════════════════════════════════════════════════════
 
 def injiser_css() -> None:
-    st.markdown(f"""
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+    """
+    Terminal-temaet. Bruker st.html og ikke st.markdown: Streamlits
+    markdown-sanitizer stripper <style> og <link>, slik at CSS-en havnet
+    som synlig tekst øverst på siden. Fontene lastes med @import inne i
+    stilblokken av samme grunn.
+    """
+    st.html(f"""
 <style>
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&family=Space+Grotesk:wght@400;500;600;700&display=swap');
+
   .stApp {{ background: {DC['bg']}; }}
   html, body, [class*="css"] {{ font-family: {SANS}; color: {DC['tekst']}; }}
 
@@ -1750,7 +1755,7 @@ def injiser_css() -> None:
   }}
   .stButton > button[kind="primary"]:hover {{ background: #4AE0A2; color: #06180F; }}
 
-  /* Segmented control / pills */
+  /* Segmented control */
   [data-testid="stSegmentedControl"] button {{
     font-family: {MONO}; font-size: 11px; letter-spacing: 0.06em;
     background: transparent; color: {DC['dempet']}; border-color: {DC['kant']};
@@ -1796,19 +1801,17 @@ def injiser_css() -> None:
   /* Fundamental-widgets pakkes tett inn i kortet over */
   [class*="st-key-gate-"] {{
     background: {DC['inset']}; border: 1px solid {DC['linje']};
-    border-radius: 10px; padding: 10px 14px 4px; margin-top: -6px;
+    border-radius: 10px; padding: 10px 14px 4px;
   }}
   [class*="st-key-rail-"] [data-testid="stCheckbox"] label {{ font-size: 11px; }}
-
-  /* Skjuler tomme markdown-wrappere som ellers lager luft */
-  [data-testid="stMarkdown"]:empty {{ display: none; }}
+  [class*="st-key-rail-"] .stButton > button {{ padding: 4px 8px; border: none; }}
 
   /* Scrollbar */
   ::-webkit-scrollbar {{ width: 10px; height: 10px; }}
   ::-webkit-scrollbar-track {{ background: {DC['bg']}; }}
   ::-webkit-scrollbar-thumb {{ background: {DC['kant']}; border-radius: 5px; }}
 </style>
-""", unsafe_allow_html=True)
+""")
 
 
 # ══════════════════════════════════════════════════════════════
