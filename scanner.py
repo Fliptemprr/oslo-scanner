@@ -57,13 +57,39 @@ SCANNER_CONFIG: dict[str, Any] = {
     "minimumHistoryYears": 2,
 
     # ── Swing-deteksjon (ATR-normalisert ZigZag) ──
-    "swingAtrMultiplier": 1.5,
+    "swing": {"atrMultiplier": 1.5},
 
     # ── Statusterskler ──
-    "correction": {"follow": 60, "correction": 75, "strong": 85},
-    "recovery": {"stabilizing": 50, "confirmed": 70},
+    "correction": {
+        "follow": 60, "correction": 75, "strong": 85,
+        # §4/§D: severity skal huske hvor alvorlig korreksjonen HAR vært.
+        # Percentilen måles på hendelsens dybde og krymper aldri, mens stretch
+        # og støtte faller når kursen henter seg inn. Uten dette gulvet mister
+        # en aksje i recovery severity-historien sin så snart lagret tilstand
+        # går tapt.
+        "severityPercentileFloor": True,
+        # Absolutt bunnkrav: fallet må være minst like stort som swing-
+        # terskelen for aksjen, ellers er det støy og ikke en korreksjon.
+        "minDepthPct": 3.0,
+    },
+    # §19/§21: samme definisjon overalt — 0-29 NO RECOVERY, 30-49 STABILIZING,
+    # 50-69 EARLY RECOVERY, 70-84 CONFIRMED, 85-100 STRONG.
+    "recovery": {
+        "stabilizing": 30, "early": 50, "confirmed": 70, "strong": 85,
+        # §17/§18/§E: recovery-poeng krever en meningsfull aktiv korreksjon.
+        # En grønn volumdag på ATH er ikke recovery.
+        "requiresSeverity": "CORRECTION",
+    },
     "trend": {"minimumForReversal": 55},
     "volume": {"recoveryRatio": 1.2, "eventRatio": 2.0},
+
+    # ── §3/§36: korreksjonens livssyklus ──
+    "lifecycle": {
+        # Andel av fallet topp→bunn som må være gjenvunnet før eventet lukkes
+        "closeRegainFraction": 0.80,
+        # Minste antall barer uten ny bunn før fasen kan forlate FALLING
+        "baseBuildingDays": 3,
+    },
 
     # ── Correction Score: vekting av delscorene ──
     "correctionScoreWeights": {
@@ -81,8 +107,21 @@ SCANNER_CONFIG: dict[str, Any] = {
         "sma50AtrFull": 5.0,
     },
 
-    # ── Support Score: trapp på avstand i % til nærmeste bekreftede swing-low ──
-    "supportSteps": [[1.0, 100], [2.0, 80], [3.0, 60], [5.0, 30]],
+    # ── §9 Support: soner, ikke én enkelt gammel swing-low ──
+    "support": {
+        # Trapp på avstand i % til nærmeste relevante sone
+        "steps": [[1.0, 100], [2.0, 80], [3.0, 60], [5.0, 30]],
+        # Relevansvindu: max(atrMaxDistanceMultiplier × ATR%, percentCap)
+        "atrMaxDistanceMultiplier": 3.0,
+        "percentCap": 8.0,
+        # Nivåer nærmere hverandre enn dette (× ATR) slås sammen til én sone
+        "clusterAtr": 0.5,
+        # Styrke etter antall prisreaksjoner i sonen
+        "strengthBase": 0.6,
+        "strengthPerTouch": 0.2,
+        # Hvor langt tilbake et nivå kan komme fra og fortsatt telle
+        "maxAgeDays": 400,
+    },
 
     # ── Correction Percentile ──
     "percentile": {
@@ -122,8 +161,9 @@ SCANNER_CONFIG: dict[str, Any] = {
     "recoveryParams": {
         "noNewLowDays": 3,
         "rsiRisingLookback": 3,
-        "localResistanceLookback": 10,
-        "higherLowReboundAtr": 1.0,
+        # §16: brudd må skje over et nivå dannet ETTER bunnen, med ATR-buffer
+        "resistanceBufferAtr": 0.15,
+        "minBarsAfterTrough": 2,
     },
 
     # ── Event Risk ──
@@ -135,13 +175,23 @@ SCANNER_CONFIG: dict[str, Any] = {
         "volumeReturn1dPct": 4.0,
         "gapFloorPct": 4.0,
         "gapAtrMult": 1.5,
+        # §25: fall som går uvanlig fort. -12 % over 40 dager er ikke det
+        # samme som -12 % på 2 dager.
+        "velocityEnabled": True,
+        "velocityMinDrawdownPct": 10.0,
+        "velocityMaxDays": 5,
     },
 
     # ── Fundamental gate (manuell i v1) ──
     "fundamentals": {"resetOnNewCorrection": True},
 
-    # ── Varsler ──
-    "alerts": {"severityStepPct": 3.0, "maxLogEntries": 200},
+    # ── §32/§33: varsler ──
+    "alerts": {
+        "severityStepPct": 3.0,
+        "maxLogEntries": 200,
+        # Samme overgang på samme correctionId varsles bare én gang
+        "eventRiskCooldownDays": 5,
+    },
 }
 
 # ── Tolkningsbånd (kun visning) ──
@@ -484,23 +534,61 @@ class HistoricalCorrection:
     atrNormalizedDrawdown: float
 
 
+# §4: fasene korreksjonen går gjennom. UI viser én status, men motoren
+# holder fase og alvorlighetsgrad hver for seg — slik at en aksje kan være
+# STRONG_CORRECTION i severity og RECOVERING i phase samtidig.
+PHASE_NORMAL = "NORMAL"
+PHASE_FALLING = "FALLING"
+PHASE_BASE_BUILDING = "BASE_BUILDING"
+PHASE_RECOVERING = "RECOVERING"
+PHASE_EVENT_RISK = "EVENT_RISK"
+PHASE_CLOSED = "CLOSED"
+
+SEV_NONE = "NONE"
+SEV_FOLLOW = "FOLLOW"
+SEV_CORRECTION = "CORRECTION"
+SEV_STRONG = "STRONG_CORRECTION"
+
+SEVERITY_RANG = {SEV_NONE: 0, SEV_FOLLOW: 1, SEV_CORRECTION: 2, SEV_STRONG: 3}
+
+
 @dataclass
-class ActiveCorrection:
-    """Korreksjonen som pågår nå (eller sist observerte topp)."""
-    id: str
+class CorrectionEvent:
+    """
+    §3/§5: korreksjonen som ett event med samme id gjennom hele forløpet.
+
+    maxDrawdownPct og currentDrawdownPct må aldri blandes. Den første er
+    hendelsens dybde og skal aldri krympe når kursen henter seg inn; den
+    andre er hvor kursen står akkurat nå.
+    """
+    correctionId: str
     ticker: str
+
     peakDate: str
     peakPrice: float
     troughDate: str
     troughPrice: float
     currentPrice: float
-    drawdownPct: float           # topp → nå (§7)
-    maxDepthPct: float           # topp → bunn, dybden på hendelsen
+
+    maxDrawdownPct: float        # topp → bunn, fryses når bunnen står
+    currentDrawdownPct: float    # topp → nå
+
+    daysPeakToTrough: int
     daysSincePeak: int
-    recoveryPct: float
+    daysSinceTrough: int
+    barsSinceTrough: int
+
+    recoveryFromTroughPct: float
+    regainedFraction: float      # hvor mye av fallet som er hentet inn, 0–1
+    correctionVelocity: float    # %-fall per dag, §25
+    correctionPercentile: float
+
+    phase: str
+    severity: str
     active: bool
-    peakConfirmed: bool          # topp bekreftet av ZigZag, ikke bare løpende maks
-    peakIdx: int                 # posisjon i serien (intern bruk)
+
+    peakConfirmed: bool
+    peakIdx: int
     troughIdx: int
 
 
@@ -854,16 +942,18 @@ def _forankre_topp(swing: SwingState, siste_dato, cfg: dict) -> tuple:
     return idx, pris
 
 
-def detect_current_correction(ticker: str, close: pd.Series, swing: SwingState,
-                              cfg: dict = SCANNER_CONFIG) -> Optional[ActiveCorrection]:
+def detect_current_correction(ticker: str, ind: dict, swing: SwingState,
+                              lagret: Optional[dict] = None,
+                              cfg: dict = SCANNER_CONFIG) -> Optional[CorrectionEvent]:
     """
-    Korreksjonen som pågår nå.
+    §3: korreksjonen som pågår, bygget fra kursdata og flettet med forrige
+    lagrede tilstand.
 
-    Toppen hentes fra _forankre_topp(). Er trenden fallende er dette en
-    ZigZag-bekreftet topp; stiger den fortsatt er det den løpende toppen, som
-    gjør at en fersk korreksjon fanges opp tidlig i stedet for å vente på
-    ATR-bekreftelse.
+    Toppen forankres deterministisk, så correctionId er stabil selv om lagret
+    tilstand går tapt. Et nytt lavpunkt oppdaterer eksisterende event i stedet
+    for å opprette et nytt (§34), og maxDrawdownPct krymper aldri (§8, §J).
     """
+    close, low = ind["close"], ind["low"]
     n = len(close)
     if n == 0:
         return None
@@ -873,34 +963,124 @@ def detect_current_correction(ticker: str, close: pd.Series, swing: SwingState,
         return None
 
     seg = close.iloc[peak_idx:].to_numpy(dtype=float)
-    trough_off = int(np.argmin(seg))
-    trough_idx = peak_idx + trough_off
-    trough_price = float(seg[trough_off])
+    trough_idx = peak_idx + int(np.argmin(seg))
+    trough_price = float(seg[int(np.argmin(seg))])
     current_price = float(close.iloc[-1])
-
-    drawdown_pct = round((peak_price - current_price) / peak_price * 100, 2)
-    max_depth_pct = round((peak_price - trough_price) / peak_price * 100, 2)
-    recovery_pct = round((current_price - trough_price) / trough_price * 100, 2) \
-        if trough_price > 0 else 0.0
     peak_date = close.index[peak_idx]
+    trough_date = close.index[trough_idx]
+    siste_dato = close.index[-1]
 
-    return ActiveCorrection(
-        id=f"{ticker}:{peak_date.strftime('%Y-%m-%d')}",
+    current_dd = round((peak_price - current_price) / peak_price * 100, 2)
+    max_dd = round((peak_price - trough_price) / peak_price * 100, 2)
+    correction_id = f"{ticker}:{peak_date.strftime('%Y-%m-%d')}"
+
+    # Flett med lagret tilstand: dybden kan bare vokse, aldri krympe.
+    if lagret and lagret.get("correctionId") == correction_id:
+        max_dd = max(max_dd, float(lagret.get("maxDrawdownPct", max_dd)))
+
+    fall = peak_price - trough_price
+    regained = ((current_price - trough_price) / fall) if fall > 0 else 1.0
+    dager_siden_topp = int((siste_dato - peak_date).days)
+
+    return CorrectionEvent(
+        correctionId=correction_id,
         ticker=ticker,
         peakDate=peak_date.strftime("%Y-%m-%d"),
         peakPrice=round(peak_price, 4),
-        troughDate=close.index[trough_idx].strftime("%Y-%m-%d"),
+        troughDate=trough_date.strftime("%Y-%m-%d"),
         troughPrice=round(trough_price, 4),
         currentPrice=round(current_price, 4),
-        drawdownPct=drawdown_pct,
-        maxDepthPct=max_depth_pct,
-        daysSincePeak=int((close.index[-1] - peak_date).days),
-        recoveryPct=recovery_pct,
-        active=drawdown_pct > 0,
+        maxDrawdownPct=max_dd,
+        currentDrawdownPct=current_dd,
+        # §27: tre forskjellige varigheter som ikke må forveksles
+        daysPeakToTrough=int((trough_date - peak_date).days),
+        daysSincePeak=dager_siden_topp,
+        daysSinceTrough=int((siste_dato - trough_date).days),
+        barsSinceTrough=n - 1 - trough_idx,
+        recoveryFromTroughPct=round((current_price - trough_price) / trough_price * 100, 2)
+        if trough_price > 0 else 0.0,
+        regainedFraction=round(max(0.0, min(1.0, regained)), 3),
+        # §25: %-fall per dag skiller -12 % over 40 dager fra -12 % på to
+        correctionVelocity=round(max_dd / max(int((trough_date - peak_date).days), 1), 3),
+        correctionPercentile=0.0,       # fylles av scan_stock
+        phase=PHASE_NORMAL,             # fylles av bestem_fase
+        severity=SEV_NONE,              # fylles av bestem_severity
+        active=current_dd > 0,
         peakConfirmed=swing.direction == -1,
         peakIdx=peak_idx,
         troughIdx=trough_idx,
     )
+
+
+def bestem_severity(correction_score: float, percentile: float,
+                    cc: CorrectionEvent, ind: dict, lagret: Optional[dict],
+                    correction_id: str, cfg: dict = SCANNER_CONFIG) -> str:
+    """
+    §4/§D: alvorlighetsgrad fra Correction Score, men den høyeste graden
+    eventet har nådd huskes. En aksje som har hatt en sterk korreksjon og
+    deretter stiger fra bunnen mister ikke historien sin.
+    """
+    c = cfg["correction"]
+
+    # §38: bunnkravet normaliseres mot aksjens egen volatilitet, så et fall
+    # som bare er vanlig dagsstøy aldri regnes som en korreksjon.
+    swing_terskel = cfg["swing"]["atrMultiplier"] * (ind.get("atrPct") or 0.0)
+    if cc.maxDrawdownPct < max(swing_terskel, c["minDepthPct"]):
+        return SEV_NONE
+
+    if c.get("severityPercentileFloor", True):
+        correction_score = max(correction_score, percentile)
+
+    if correction_score >= c["strong"]:
+        naa = SEV_STRONG
+    elif correction_score >= c["correction"]:
+        naa = SEV_CORRECTION
+    elif correction_score >= c["follow"]:
+        naa = SEV_FOLLOW
+    else:
+        naa = SEV_NONE
+
+    if lagret and lagret.get("correctionId") == correction_id:
+        tidligere = lagret.get("severity", SEV_NONE)
+        if SEVERITY_RANG.get(tidligere, 0) > SEVERITY_RANG[naa]:
+            return tidligere
+    return naa
+
+
+def bestem_fase(cc: CorrectionEvent, recovery_score: float, higher_low: bool,
+                event_risk: bool, fundamentals_checked: bool,
+                cfg: dict = SCANNER_CONFIG) -> str:
+    """
+    §4/§20/§36: hvilken fase korreksjonen er i.
+
+    Rekkefølgen er bindende. Et nytt lavpunkt sender fasen tilbake til
+    FALLING (§34, §35) fordi barsSinceTrough da nullstilles.
+    """
+    lc = cfg["lifecycle"]
+    rec = cfg["recovery"]
+
+    if event_risk and not fundamentals_checked:
+        return PHASE_EVENT_RISK
+
+    if cc.severity == SEV_NONE and cc.currentDrawdownPct <= 0:
+        return PHASE_NORMAL
+
+    # §36: eventet lukkes først når fallet i hovedsak er hentet inn og
+    # strukturen er positiv, eller kursen har tatt ut toppen.
+    if cc.currentPrice > cc.peakPrice or (
+            cc.regainedFraction >= lc["closeRegainFraction"] and higher_low):
+        return PHASE_CLOSED
+
+    if cc.severity == SEV_NONE:
+        return PHASE_NORMAL
+
+    if cc.barsSinceTrough < lc["baseBuildingDays"]:
+        return PHASE_FALLING
+
+    if recovery_score >= rec["early"] and higher_low:
+        return PHASE_RECOVERING
+
+    return PHASE_BASE_BUILDING
 
 
 def percentile_rank(current: float, history: list) -> float:
@@ -912,7 +1092,7 @@ def percentile_rank(current: float, history: list) -> float:
     return round(below / len(valid) * 100, 1)
 
 
-def calculate_correction_percentile(current: Optional[ActiveCorrection],
+def calculate_correction_percentile(current: Optional[CorrectionEvent],
                                     history: list, atr_at_peak: Optional[float],
                                     cfg: dict) -> tuple:
     """
@@ -931,6 +1111,9 @@ def calculate_correction_percentile(current: Optional[ActiveCorrection],
     # Historiske korreksjoner måles topp→bunn. Med basis "maxDepth" måles
     # dagens korreksjon på samme måte, slik at sammenligningen er ekte
     # eple-mot-eple og ikke krymper etter hvert som kursen henter seg inn.
+    # §8: historiske korreksjoner måles topp→bunn, så dagens måles på samme
+    # måte. Recovery etter bunnen skal ikke gjøre den historiske korreksjonen
+    # mindre.
     bruk_dybde = cfg["percentile"].get("basis", "maxDepth") == "maxDepth"
     referansepris = current.troughPrice if bruk_dybde else current.currentPrice
 
@@ -940,7 +1123,7 @@ def calculate_correction_percentile(current: Optional[ActiveCorrection],
         naa = (current.peakPrice - referansepris) / atr_at_peak
         verdier = [h.atrNormalizedDrawdown for h in sammenlign]
     else:
-        naa = current.maxDepthPct if bruk_dybde else current.drawdownPct
+        naa = current.maxDrawdownPct if bruk_dybde else current.currentDrawdownPct
         verdier = [h.drawdownPct for h in sammenlign]
 
     return percentile_rank(naa, verdier), len(verdier)
@@ -962,32 +1145,95 @@ def _skalér(verdi: Optional[float], null_ved: float, full_ved: float) -> float:
     return max(0.0, min(100.0, andel * 100.0))
 
 
-def nearest_support(current_price: float, swing: SwingState,
-                    current: Optional[ActiveCorrection]) -> Optional[float]:
+def finn_supportsoner(ind: dict, swing: SwingState,
+                      current: Optional[CorrectionEvent],
+                      cfg: dict = SCANNER_CONFIG) -> list:
     """
-    Nærmeste bekreftede swing-low. Bunnen i den pågående korreksjonen regnes
-    ikke som støtte – den er ikke bekreftet ennå. Bekreftede bunner tidligere
-    inne i samme korreksjon teller derimot med; gammel støtte er ofte nettopp
-    det nivået som testes på nytt.
+    §9: støtte som soner, ikke ett enkelt gammelt bunnpunkt.
+
+    Kandidater er bekreftede swing-lows, tidligere topper som er brutt og
+    kan retestes, og SMA50/SMA200 som dynamisk støtte. Nivåer som ligger
+    tett slås sammen, og antall prisreaksjoner gir sonen styrke.
     """
-    kandidater = [
-        p["price"] for p in swing.pivots
-        if p["kind"] == "trough" and p["price"] > 0
-        and (current is None or p["idx"] < current.troughIdx)
-    ]
+    sc = cfg["support"]
+    kurs, atr = ind.get("close_now"), ind.get("atr")
+    if not kurs or not atr or atr <= 0:
+        return []
+
+    siste = ind["index"][-1]
+    grense_dato = pd.Timestamp(siste) - pd.Timedelta(days=sc["maxAgeDays"])
+    aktiv_bunn = current.troughIdx if current else len(ind["close"])
+
+    kandidater = []
+    for p in swing.pivots:
+        if p["date"] < grense_dato or p["idx"] >= aktiv_bunn:
+            continue
+        if p["kind"] == "trough":
+            kandidater.append((p["price"], "swing-low"))
+        elif p["kind"] == "peak" and p["price"] < kurs:
+            # Brutt topp som kan retestes nedenfra
+            kandidater.append((p["price"], "brutt topp"))
+
+    for navn, verdi in (("SMA50", ind.get("sma50")), ("SMA200", ind.get("sma200"))):
+        if verdi and verdi <= kurs:
+            kandidater.append((verdi, navn))
+
+    kandidater = [(p, k) for p, k in kandidater if p and p > 0 and p <= kurs * 1.005]
     if not kandidater:
-        return None
-    return min(kandidater, key=lambda p: abs(current_price - p))
+        return []
+
+    # Slå sammen nivåer som ligger nærmere hverandre enn clusterAtr × ATR
+    kandidater.sort(key=lambda x: x[0])
+    toleranse = atr * sc["clusterAtr"]
+    soner = []
+    for pris, kilde in kandidater:
+        if soner and abs(pris - soner[-1]["nivå"]) <= toleranse:
+            z = soner[-1]
+            z["nivå"] = (z["nivå"] * z["treff"] + pris) / (z["treff"] + 1)
+            z["treff"] += 1
+            if kilde not in z["kilder"]:
+                z["kilder"].append(kilde)
+        else:
+            soner.append({"nivå": pris, "treff": 1, "kilder": [kilde]})
+
+    for z in soner:
+        z["nivå"] = round(z["nivå"], 4)
+        z["avstandPct"] = round((kurs - z["nivå"]) / z["nivå"] * 100, 2) if z["nivå"] else None
+        z["styrke"] = min(1.0, sc["strengthBase"] + sc["strengthPerTouch"] * (z["treff"] - 1))
+    return sorted(soner, key=lambda z: z["avstandPct"])
 
 
-def support_score(distance_pct: Optional[float], steps: list) -> float:
-    """Trapp: jo nærmere bekreftet støtte, jo høyere score."""
-    if distance_pct is None or not math.isfinite(distance_pct):
-        return 0.0
-    for grense, poeng in steps:
-        if distance_pct <= grense:
-            return float(poeng)
-    return 0.0
+def relevansvindu(ind: dict, cfg: dict = SCANNER_CONFIG) -> float:
+    """§9: hvor langt under kursen en støtte fortsatt er relevant for traden."""
+    sc = cfg["support"]
+    atr_pct = ind.get("atrPct") or 0.0
+    return max(atr_pct * sc["atrMaxDistanceMultiplier"], sc["percentCap"])
+
+
+def support_score(soner: list, vindu: float, cfg: dict = SCANNER_CONFIG) -> tuple:
+    """
+    §9/§K: 0 poeng dersom ingen relevant sone finnes.
+
+    En gammel swing-low 20–30 % under kursen er ikke entry-støtte, og skal
+    ikke gi poeng bare fordi den eksisterer.
+    """
+    sc = cfg["support"]
+    relevante = [z for z in soner
+                 if z["avstandPct"] is not None and 0 <= z["avstandPct"] <= vindu]
+    if not relevante:
+        return 0.0, None
+
+    beste, beste_score = None, 0.0
+    for z in relevante:
+        grunn = 0.0
+        for grense, poeng in sc["steps"]:
+            if z["avstandPct"] <= grense:
+                grunn = float(poeng)
+                break
+        score = grunn * z["styrke"]
+        if score > beste_score:
+            beste_score, beste = score, z
+    return round(beste_score, 1), beste
 
 
 def technical_stretch_score(ind: dict, cfg: dict) -> tuple:
@@ -1032,7 +1278,12 @@ def calculate_correction_score(percentile: float, stretch: float,
 
 
 def has_higher_low_structure(swing: SwingState) -> bool:
-    """De to siste bekreftede bunnene: er den nyeste høyere enn den forrige?"""
+    """
+    §11: trendens higher-low vurderer den BREDE strukturen — de to siste
+    bekreftede bunnene i hele serien. Recovery-scorens confirmed higher low
+    er et annet signal som må ligge etter den aktive korreksjonens bunn, og
+    beregnes i confirmed_higher_low(). De to skal aldri være samme test.
+    """
     bunner = [p["price"] for p in swing.pivots if p["kind"] == "trough"]
     if len(bunner) < 2:
         return False
@@ -1060,55 +1311,89 @@ def calculate_trend_score(ind: dict, swing: SwingState, cfg: dict) -> tuple:
     return float(min(score, 100)), deler
 
 
-def _confirmed_higher_low(close: pd.Series, current: ActiveCorrection,
-                          atr_now: Optional[float], cfg: dict) -> tuple:
+def confirmed_higher_low(swing: SwingState, current: Optional[CorrectionEvent],
+                         ind: dict, cfg: dict = SCANNER_CONFIG) -> tuple:
     """
-    Bekreftet higher low etter korreksjonsbunnen:
-    kursen må først ha reist seg ATR * faktor fra bunnen, deretter satt en
-    ny lokal bunn som holdt seg over korreksjonsbunnen, og nå ligge over den.
+    §14: bunn → bounce → pullback → pullback holder over bunnen → bekreftet.
+
+    Den nye bunnen må være bekreftet av ZigZag-logikken, altså at kursen har
+    snudd ATR × multiplier fra den. En eldre higher-low teller ikke — pivoten
+    må ligge etter korreksjonsbunnen (§11).
     """
-    c = close.to_numpy(dtype=float)
-    n = len(c)
-    t_idx = current.troughIdx
-    if not atr_now or atr_now <= 0 or t_idx >= n - 2:
+    if current is None or not current.active:
         return False, None
 
-    grense = current.troughPrice + atr_now * cfg["recoveryParams"]["higherLowReboundAtr"]
-    rebound = next((i for i in range(t_idx + 1, n) if c[i] >= grense), None)
-    if rebound is None or rebound >= n - 2:
+    etter_bunn = [p for p in swing.pivots
+                  if p["kind"] == "trough" and p["idx"] > current.troughIdx
+                  and p["price"] > current.troughPrice]
+    if not etter_bunn:
         return False, None
 
-    etter = c[rebound + 1:]
-    if len(etter) == 0:
+    hl = etter_bunn[-1]
+    kurs = ind.get("close_now")
+    if kurs is None or kurs <= hl["price"]:
         return False, None
-    hl_idx = rebound + 1 + int(np.argmin(etter))
-    hl_pris = float(c[hl_idx])
-
-    if hl_pris <= current.troughPrice or hl_idx >= n - 1 or c[-1] <= hl_pris:
-        return False, None
-    return True, round(hl_pris, 4)
+    return True, round(hl["price"], 4)
 
 
-def calculate_recovery_score(ind: dict, current: Optional[ActiveCorrection],
-                             cfg: dict) -> tuple:
-    """Har markedet begynt å vise tegn til at korreksjonen kan være ferdig?"""
+def lokal_motstand(swing: SwingState, current: Optional[CorrectionEvent],
+                   ind: dict, cfg: dict = SCANNER_CONFIG) -> Optional[float]:
+    """
+    §16: motstanden må være dannet ETTER bunnen i den aktive korreksjonen,
+    ikke et tilfeldig gammelt nivå lenger tilbake i charten.
+    """
+    if current is None or not current.active:
+        return None
+
+    etter_bunn = [p["price"] for p in swing.pivots
+                  if p["kind"] == "peak" and p["idx"] > current.troughIdx]
+    if etter_bunn:
+        return round(max(etter_bunn), 4)
+
+    # Ingen bekreftet topp ennå: bruk høyeste high mellom bunn og i går
+    high = ind["high"]
+    fra = current.troughIdx + 1
+    til = len(high) - 1
+    if til - fra < cfg["recoveryParams"]["minBarsAfterTrough"]:
+        return None
+    return _num(high.iloc[fra:til].max())
+
+
+def calculate_recovery_score(ind: dict, swing: SwingState,
+                             current: Optional[CorrectionEvent],
+                             cfg: dict = SCANNER_CONFIG) -> tuple:
+    """
+    §12/§17/§18/§E: samtlige recovery-signaler krever en aktiv, meningsfull
+    korreksjon. En grønn volumdag på ATH er ikke recovery.
+    """
     p = cfg["recoveryPoints"]
     rp = cfg["recoveryParams"]
-    close = ind["close"]
-    high = ind["high"]
-    n = len(close)
+    tom = {k: False for k in p}
 
-    if current is not None:
-        no_new_low = current.troughIdx <= n - 1 - rp["noNewLowDays"]
-        higher_low, hl_pris = _confirmed_higher_low(close, current, ind.get("atr"), cfg)
-    else:
-        no_new_low, higher_low, hl_pris = False, False, None
+    krav = SEVERITY_RANG.get(cfg["recovery"].get("requiresSeverity", "CORRECTION"), 2)
+    meningsfull = (current is not None and current.active
+                   and SEVERITY_RANG.get(current.severity, 0) >= krav
+                   and current.phase != PHASE_CLOSED)
+    if not meningsfull:
+        tom["higherLowPrice"] = None
+        tom["localResistance"] = None
+        tom["ingenAktivKorreksjon"] = True
+        return 0.0, tom
 
-    lookback = rp["localResistanceLookback"]
-    lokal_motstand = _num(high.iloc[-(lookback + 1):-1].max()) if n > lookback else None
+    # §13: krever at en bunnkandidat faktisk finnes, og at det har gått
+    # minst noen dager siden den uten nytt lavpunkt.
+    no_new_low = current.barsSinceTrough >= rp["noNewLowDays"]
+
+    higher_low, hl_pris = confirmed_higher_low(swing, current, ind, cfg)
+
+    motstand = lokal_motstand(swing, current, ind, cfg)
+    kurs, atr = ind.get("close_now"), ind.get("atr")
+    buffer_ = (atr or 0) * rp["resistanceBufferAtr"]
+    bryter = bool(kurs is not None and motstand is not None
+                  and kurs > motstand + buffer_)
 
     rsi, rsi_prev = ind.get("rsi"), ind.get("rsiPrev")
-    kurs, sma20 = ind.get("close_now"), ind.get("sma20")
+    sma20 = ind.get("sma20")
     ret1d, vr = ind.get("return1d"), ind.get("volumeRatio20d")
     mom5d = ind.get("momentum5d")
 
@@ -1117,19 +1402,20 @@ def calculate_recovery_score(ind: dict, current: Optional[ActiveCorrection],
         "higherLowConfirmed": bool(higher_low),
         "rsiRising": bool(rsi is not None and rsi_prev is not None and rsi > rsi_prev),
         "closeOverSma20": bool(kurs is not None and sma20 is not None and kurs > sma20),
-        "breaksLocalResistance": bool(kurs is not None and lokal_motstand is not None
-                                      and kurs > lokal_motstand),
-        "greenDayHighVolume": bool(ret1d is not None and ret1d > 0
-                                   and vr is not None and vr >= cfg["volume"]["recoveryRatio"]),
+        "breaksLocalResistance": bryter,
+        "greenDayHighVolume": bool(ret1d is not None and ret1d > 0 and vr is not None
+                                   and vr >= cfg["volume"]["recoveryRatio"]),
         "positiveMomentum5d": bool(mom5d is not None and mom5d > 0),
     }
     score = sum(p[k] for k, v in deler.items() if v)
     deler["higherLowPrice"] = hl_pris
-    deler["localResistance"] = round(lokal_motstand, 4) if lokal_motstand else None
+    deler["localResistance"] = round(motstand, 4) if motstand else None
+    deler["ingenAktivKorreksjon"] = False
     return float(min(score, 100)), deler
 
 
-def detect_event_risk(ind: dict, cfg: dict) -> tuple:
+def detect_event_risk(ind: dict, current: Optional[CorrectionEvent],
+                      cfg: dict = SCANNER_CONFIG) -> tuple:
     """
     Skiller ut fall som mest sannsynlig er hendelsesdrevne (resultatvarsel,
     emisjon, regulatorisk nyhet). Et slikt fall skal ikke belønnes som en
@@ -1149,13 +1435,22 @@ def detect_event_risk(ind: dict, cfg: dict) -> tuple:
                         and r1d is not None and r1d <= -e["volumeReturn1dPct"])
     abnormal_gap = bool(gap is not None and gap >= max(e["gapFloorPct"], atr_pct * e["gapAtrMult"]))
 
+    # §25: et fall som går uvanlig fort er en annen type hendelse enn det
+    # samme fallet fordelt over mange uker.
+    abnormal_fart = False
+    if e.get("velocityEnabled") and current is not None:
+        abnormal_fart = bool(current.maxDrawdownPct >= e["velocityMinDrawdownPct"]
+                             and current.daysPeakToTrough <= e["velocityMaxDays"]
+                             and current.barsSinceTrough <= e["velocityMaxDays"])
+
     grunner = {
         "abnormal1D": abnormal_1d,
         "abnormal3D": abnormal_3d,
         "abnormalVolume": abnormal_vol,
         "abnormalGap": abnormal_gap,
+        "abnormalVelocity": abnormal_fart,
     }
-    return (abnormal_1d or abnormal_3d or abnormal_vol or abnormal_gap), grunner
+    return any(grunner.values()), grunner
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1164,40 +1459,38 @@ def detect_event_risk(ind: dict, cfg: dict) -> tuple:
 
 def classify_status(r: dict, cfg: dict = SCANNER_CONFIG) -> str:
     """
-    Statusmotor. Rekkefølgen er bindende.
+    §20: brukerstatusen utledes av intern fase og alvorlighetsgrad.
 
-    Event risk overstyrer alt inntil manuell kontroll. REVERSAL krever både
-    høy recovery, frisk nok trend og godkjent fundamental sjekk – høy
-    Correction Score alene er aldri nok.
+    Det viktige er at en aksje som har falt mye, og deretter begynner å hente
+    seg inn, får lov til å gå STRONG CORRECTION → STABILIZING selv om
+    severity internt fortsatt er STRONG_CORRECTION. Vi tvinger den ikke til å
+    bli værende på det verste den har vært.
     """
-    c = cfg["correction"]
-    rec = cfg["recovery"]
+    fase, sev = r["phase"], r["severity"]
 
-    if r["eventRisk"] and not r["fundamentalsChecked"]:
+    if fase == PHASE_EVENT_RISK:
         return STATUS_EVENT_RISK
 
-    if r["correctionScore"] < c["follow"]:
+    if fase in (PHASE_CLOSED, PHASE_NORMAL) or sev == SEV_NONE:
         return STATUS_WAIT
 
-    if r["correctionScore"] < c["correction"]:
+    if sev == SEV_FOLLOW:
         return STATUS_FOLLOW
 
-    if r["correctionScore"] >= c["strong"] and r["recoveryScore"] < rec["stabilizing"]:
-        return STATUS_STRONG_CORRECTION
-
-    if r["correctionScore"] >= c["correction"] and r["recoveryScore"] < rec["stabilizing"]:
-        return STATUS_CORRECTION
-
-    if (r["correctionScore"] >= c["correction"]
-            and rec["stabilizing"] <= r["recoveryScore"] < rec["confirmed"]):
+    if fase == PHASE_RECOVERING:
+        # §22: REVERSAL er strengt. Alle vilkårene må være oppfylt samtidig.
+        if (r["recoveryScore"] >= cfg["recovery"]["confirmed"]
+                and r["trendScore"] >= cfg["trend"]["minimumForReversal"]
+                and r["fundamentalsChecked"] and r["thesisIntact"]
+                and not r["eventRisk"]):
+            return STATUS_REVERSAL
         return STATUS_STABILIZING
 
-    if (r["correctionScore"] >= c["correction"]
-            and r["recoveryScore"] >= rec["confirmed"]
-            and r["trendScore"] >= cfg["trend"]["minimumForReversal"]
-            and r["fundamentalsChecked"]
-            and r["thesisIntact"]):
-        return STATUS_REVERSAL
+    if fase == PHASE_BASE_BUILDING:
+        return STATUS_STABILIZING
+
+    if fase == PHASE_FALLING:
+        return STATUS_STRONG_CORRECTION if sev == SEV_STRONG else STATUS_CORRECTION
 
     return STATUS_FOLLOW
 
@@ -1235,56 +1528,73 @@ def resolve_fundamentals(store: dict, ticker: str, correction_id: str,
 
 
 def scan_stock(ticker: str, df: pd.DataFrame, fund_store: dict,
+               lagret_state: Optional[dict] = None,
                cfg: dict = SCANNER_CONFIG) -> Optional[dict]:
     """
-    Hovedmotoren for én aksje: indikatorer → swings → korreksjonshistorikk →
-    percentil → tre scorer → event risk → fundamental gate → status.
+    Hovedmotoren for én aksje.
+
+    Rekkefølgen er bindende, fordi ledd henger på hverandre: severity trengs
+    for å gate recovery (§17), recovery og higher low trengs for å bestemme
+    fase (§4), og fasen bestemmer statusen (§20).
     """
     ind = calculate_indicators(df)
     if ind is None:
         log.warning(f"[{ticker}] for kort historikk, hoppes over")
         return None
 
-    swing = detect_swings(ind["close"], ind["atr_s"], cfg["swingAtrMultiplier"])
+    swing = detect_swings(ind["close"], ind["atr_s"], cfg["swing"]["atrMultiplier"])
     historikk = detect_historical_corrections(ticker, ind["atr_s"], swing, cfg)
-    current = detect_current_correction(ticker, ind["close"], swing, cfg)
+    cc = detect_current_correction(ticker, ind, swing, lagret_state, cfg)
+    if cc is None:
+        return None
 
-    atr_at_peak = _num(ind["atr_s"].iloc[current.peakIdx]) if current else None
-    percentile, n_hist = calculate_correction_percentile(current, historikk, atr_at_peak, cfg)
+    # 1. Percentil på hendelsens dybde (§8)
+    atr_at_peak = _num(ind["atr_s"].iloc[cc.peakIdx])
+    percentile, n_hist = calculate_correction_percentile(cc, historikk, atr_at_peak, cfg)
+    cc.correctionPercentile = percentile
 
+    # 2. Correction Score (§7)
     stretch, stretch_deler = technical_stretch_score(ind, cfg)
-
-    støtte_nivå = nearest_support(ind["close_now"], swing, current)
-    støtte_avstand = (abs(ind["close_now"] - støtte_nivå) / støtte_nivå * 100
-                      if støtte_nivå and støtte_nivå > 0 else None)
-    støtte = support_score(støtte_avstand, cfg["supportSteps"])
-
+    soner = finn_supportsoner(ind, swing, cc, cfg)
+    vindu = relevansvindu(ind, cfg)
+    støtte, beste_sone = support_score(soner, vindu, cfg)
     correction_score = calculate_correction_score(percentile, stretch, støtte, cfg)
-    trend_score, trend_deler = calculate_trend_score(ind, swing, cfg)
-    recovery_score, recovery_deler = calculate_recovery_score(ind, current, cfg)
-    event_risk, event_grunner = detect_event_risk(ind, cfg)
 
-    correction_id = current.id if current else f"{ticker}:ingen"
-    fund = resolve_fundamentals(fund_store, ticker, correction_id, cfg)
+    # 3. Severity huskes på sitt høyeste for eventet (§4, §D)
+    cc.severity = bestem_severity(correction_score, percentile, cc, ind,
+                                  lagret_state, cc.correctionId, cfg)
+
+    # 4. Trend (§10) og recovery (§12), sistnevnte gatet på aktiv korreksjon
+    trend_score, trend_deler = calculate_trend_score(ind, swing, cfg)
+    recovery_score, recovery_deler = calculate_recovery_score(ind, swing, cc, cfg)
+    higher_low = bool(recovery_deler.get("higherLowConfirmed"))
+
+    # 5. Event risk (§24) og fundamental gate (§23)
+    event_risk, event_grunner = detect_event_risk(ind, cc, cfg)
+    fund = resolve_fundamentals(fund_store, ticker, cc.correctionId, cfg)
+
+    # 6. Fase, og dermed status (§4, §20)
+    cc.phase = bestem_fase(cc, recovery_score, higher_low, event_risk,
+                           fund.fundamentalsChecked, cfg)
 
     resultat = {
         "ticker": ticker,
         "Ticker": ticker.replace(".OL", ""),
         "Navn": OSLO_TICKERS.get(ticker, ticker),
-
         "correctionScore": correction_score,
         "trendScore": trend_score,
         "recoveryScore": recovery_score,
         "eventRisk": event_risk,
         "fundamentalsChecked": fund.fundamentalsChecked,
         "thesisIntact": fund.thesisIntact,
+        "phase": cc.phase,
+        "severity": cc.severity,
     }
     resultat["status"] = classify_status(resultat, cfg)
 
-    # Støtteinformasjon til visning – påvirker ikke statusen
     resultat.update({
-        "correctionId": correction_id,
-        "currentCorrection": current,
+        "correctionId": cc.correctionId,
+        "currentCorrection": cc,
         "correctionPercentile": percentile,
         "historiskeKorreksjoner": historikk,
         "antallHistoriske": n_hist,
@@ -1292,8 +1602,9 @@ def scan_stock(ticker: str, df: pd.DataFrame, fund_store: dict,
         "stretchScore": stretch,
         "stretchDeler": stretch_deler,
         "supportScore": støtte,
-        "supportNivå": round(støtte_nivå, 4) if støtte_nivå else None,
-        "supportAvstandPct": round(støtte_avstand, 2) if støtte_avstand is not None else None,
+        "supportSoner": soner,
+        "supportSone": beste_sone,
+        "supportVindu": round(vindu, 2),
         "trendDeler": trend_deler,
         "trendBand": _band(trend_score, TREND_BANDS),
         "recoveryDeler": recovery_deler,
@@ -1394,6 +1705,8 @@ def last_state() -> dict:
         raw = {}
     raw.setdefault("statuses", {})
     raw.setdefault("alerts", [])
+    raw.setdefault("corrections", {})
+    raw.setdefault("varslet", {})
     return raw
 
 
@@ -1407,11 +1720,18 @@ def lagre_state(state: dict) -> None:
 # alvorlighetsgraden øker vesentlig innenfor samme correctionId.
 # ══════════════════════════════════════════════════════════════
 
+# §32: hvilke overganger som fortjener et varsel. FOLLOW trenger ikke push,
+# WAIT skal aldri gi push.
 VARSEL_OVERGANGER = {
+    (None, STATUS_CORRECTION),
+    (STATUS_WAIT, STATUS_CORRECTION),
     (STATUS_FOLLOW, STATUS_CORRECTION),
     (STATUS_CORRECTION, STATUS_STRONG_CORRECTION),
     (STATUS_CORRECTION, STATUS_STABILIZING),
+    (STATUS_STRONG_CORRECTION, STATUS_STABILIZING),
     (STATUS_STABILIZING, STATUS_REVERSAL),
+    (STATUS_CORRECTION, STATUS_REVERSAL),
+    (STATUS_STRONG_CORRECTION, STATUS_REVERSAL),
 }
 
 
@@ -1422,7 +1742,9 @@ def _varselsammendrag(r: dict, fra: Optional[str] = None) -> str:
     if fra:
         biter.append(f"fra {fra.replace('_', ' ')}")
     if cc:
-        biter.append(f"-{cc.drawdownPct:.1f} %")
+        biter.append(f"nå -{cc.currentDrawdownPct:.1f} %")
+        if cc.maxDrawdownPct > cc.currentDrawdownPct + 0.5:
+            biter.append(f"max -{cc.maxDrawdownPct:.1f} %")
     biter.append(f"percentil {r['correctionPercentile']:.0f}")
     biter.append(f"Trend {r['trendBand']}")
     return " · ".join(biter)
@@ -1430,12 +1752,12 @@ def _varselsammendrag(r: dict, fra: Optional[str] = None) -> str:
 
 def _varseltekst(r: dict, tittel: str) -> str:
     cc = r.get("currentCorrection")
-    fall = f"{cc.drawdownPct:.1f} %" if cc else "—"
     return (
         f"{r['Ticker']} – {tittel}\n\n"
         f"Correction Score: {r['correctionScore']:.0f}\n"
-        f"Korreksjon: -{fall}\n"
-        f"Historisk percentil: {r['correctionPercentile']:.0f}\n\n"
+        + (f"Korreksjon nå: -{cc.currentDrawdownPct:.1f} %\n"
+           f"Maks dybde: -{cc.maxDrawdownPct:.1f} %\n" if cc else "")
+        + f"Historisk percentil: {r['correctionPercentile']:.0f}\n\n"
         f"Trend: {r['trendBand']}\n"
         f"Recovery: {r['recoveryBand']}\n\n"
         f"Åpne radaren for gjennomgang."
@@ -1444,52 +1766,98 @@ def _varseltekst(r: dict, tittel: str) -> str:
 
 def evaluer_varsler(resultater: list, state: dict, cfg: dict = SCANNER_CONFIG) -> list:
     """
-    Sammenlign mot forrige lagrede tilstand og produser varsler.
-    Aldri varsel for WAIT. Idempotent: uendret tilstand gir ingen nye varsler.
+    §32/§33/§M: varsler på meningsfulle overganger, aldri samme overgang to
+    ganger for samme correctionId.
+
+    Går en aksje STRONG → STABILIZING → STRONG → STABILIZING skal den ikke
+    spamme identisk varsel hver dag. EVENT RISK har egen cooldown, fordi en ny
+    alvorlig hendelse skal kunne varsles på nytt.
     """
     nye = []
     statuses = state.setdefault("statuses", {})
-    naa = datetime.now(ZoneInfo("Europe/Oslo")).strftime("%Y-%m-%d %H:%M")
+    korreksjoner = state.setdefault("corrections", {})
+    varslet = state.setdefault("varslet", {})
+    naa_dt = datetime.now(ZoneInfo("Europe/Oslo"))
+    naa = naa_dt.strftime("%Y-%m-%d %H:%M")
 
     for r in resultater:
         t = r["ticker"]
+        cc = r.get("currentCorrection")
         forrige = statuses.get(t, {})
         forrige_status = forrige.get("status")
-        forrige_id = forrige.get("correctionId")
-        forrige_dd = forrige.get("drawdownPct")
-        cc = r.get("currentCorrection")
-        dd = cc.drawdownPct if cc else None
-
         ny_status = r["status"]
+        cid = r["correctionId"]
 
-        if ny_status != forrige_status and ny_status != STATUS_WAIT:
-            if ny_status == STATUS_EVENT_RISK:
-                nye.append({"tid": naa, "ticker": r["Ticker"], "type": "EVENT_RISK",
-                            "correctionId": r["correctionId"],
+        # Sendte overganger huskes per correctionId, ikke per ticker.
+        sendt = varslet.setdefault(cid, [])
+        overgang = f"{forrige_status or 'NY'}->{ny_status}"
+
+        if ny_status == STATUS_EVENT_RISK:
+            sist = forrige.get("eventRiskVarslet")
+            moden = True
+            if sist:
+                try:
+                    dager = (naa_dt - datetime.fromisoformat(sist)).days
+                    moden = dager >= cfg["alerts"]["eventRiskCooldownDays"]
+                except ValueError:
+                    moden = True
+            if moden:
+                nye.append({"tid": naa, "ticker": r["Ticker"], "type": STATUS_EVENT_RISK,
+                            "correctionId": cid, "overgang": overgang,
                             "sammendrag": _varselsammendrag(r),
                             "tekst": _varseltekst(r, "EVENT RISK – UNDERSØK")})
-            elif (forrige_status, ny_status) in VARSEL_OVERGANGER:
-                nye.append({"tid": naa, "ticker": r["Ticker"], "type": ny_status,
-                            "correctionId": r["correctionId"],
-                            "sammendrag": _varselsammendrag(r, forrige_status),
-                            "tekst": _varseltekst(r, ny_status.replace("_", " "))})
+                forrige["eventRiskVarslet"] = naa_dt.isoformat()
 
-        elif (ny_status == forrige_status
-              and forrige_id == r["correctionId"]
-              and dd is not None and forrige_dd is not None
-              and dd - forrige_dd >= cfg["alerts"]["severityStepPct"]
-              and ny_status not in (STATUS_WAIT, STATUS_FOLLOW)):
-            nye.append({"tid": naa, "ticker": r["Ticker"], "type": f"{ny_status}+",
-                        "correctionId": r["correctionId"],
-                        "sammendrag": f"severity økt · {_varselsammendrag(r)}",
-                        "tekst": _varseltekst(r, f"{ny_status.replace('_', ' ')} – severity økt")})
+        elif (ny_status != forrige_status
+              and (forrige_status, ny_status) in VARSEL_OVERGANGER
+              and overgang not in sendt):
+            sendt.append(overgang)
+            nye.append({"tid": naa, "ticker": r["Ticker"], "type": ny_status,
+                        "correctionId": cid, "overgang": overgang,
+                        "sammendrag": _varselsammendrag(r, forrige_status),
+                        "tekst": _varseltekst(r, ny_status.replace("_", " "))})
+
+        elif (ny_status == forrige_status and forrige.get("correctionId") == cid
+              and cc is not None and forrige.get("maxDrawdownPct") is not None
+              and cc.maxDrawdownPct - forrige["maxDrawdownPct"] >= cfg["alerts"]["severityStepPct"]
+              and ny_status in (STATUS_CORRECTION, STATUS_STRONG_CORRECTION)):
+            merke = f"{overgang}@{cc.maxDrawdownPct:.0f}"
+            if merke not in sendt:
+                sendt.append(merke)
+                nye.append({"tid": naa, "ticker": r["Ticker"], "type": f"{ny_status}+",
+                            "correctionId": cid, "overgang": merke,
+                            "sammendrag": f"dypere · {_varselsammendrag(r)}",
+                            "tekst": _varseltekst(
+                                r, f"{ny_status.replace('_', ' ')} – dypere")})
 
         statuses[t] = {
+            **{k: v for k, v in forrige.items() if k == "eventRiskVarslet"},
             "status": ny_status,
-            "correctionId": r["correctionId"],
-            "drawdownPct": dd,
+            "correctionId": cid,
+            "maxDrawdownPct": cc.maxDrawdownPct if cc else None,
+            "currentDrawdownPct": cc.currentDrawdownPct if cc else None,
+            "phase": r["phase"],
+            "severity": r["severity"],
             "oppdatert": naa,
         }
+
+        # §3: eventets tilstand bæres videre til neste skanning
+        if cc is not None:
+            korreksjoner[t] = {
+                "correctionId": cid,
+                "maxDrawdownPct": cc.maxDrawdownPct,
+                "severity": cc.severity,
+                "phase": cc.phase,
+                "peakDate": cc.peakDate,
+                "troughDate": cc.troughDate,
+                "oppdatert": naa,
+            }
+
+    # Rydd bort varselhistorikk for korreksjoner som ikke lenger er aktive
+    aktive_ider = {r["correctionId"] for r in resultater}
+    for cid in list(varslet):
+        if cid not in aktive_ider:
+            varslet.pop(cid, None)
 
     if nye:
         logg = nye + state.get("alerts", [])
@@ -1600,12 +1968,14 @@ def hent_prisdata(tickers: tuple) -> dict:
     return alle
 
 
-def kjor_scan(prisdata: dict, fund_store: dict, cfg: dict = SCANNER_CONFIG) -> list:
-    """Kjør motoren på alle nedlastede aksjer."""
+def kjor_scan(prisdata: dict, fund_store: dict, state: Optional[dict] = None,
+              cfg: dict = SCANNER_CONFIG) -> list:
+    """Kjør motoren på alle nedlastede aksjer, med forrige tilstand som input."""
+    lagrede = (state or {}).get("corrections", {})
     ut = []
     for ticker, df in prisdata.items():
         try:
-            r = scan_stock(ticker, df, fund_store, cfg)
+            r = scan_stock(ticker, df, fund_store, lagrede.get(ticker), cfg)
             if r is not None:
                 ut.append(r)
         except Exception as e:
@@ -2000,21 +2370,21 @@ def tabell_rader(resultater: list) -> pd.DataFrame:
     rader = []
     for r in resultater:
         cc, ind = r.get("currentCorrection"), r["ind"]
-        navn = r["Navn"]
-        if r["tynnHistorikk"]:
-            navn += " · tynn historikk"
         status = STATUS_KORT[r["status"]]
         if reversal_blokkert(r):
             status += " · GATE"
+        fase = {PHASE_FALLING: "↓", PHASE_BASE_BUILDING: "=",
+                PHASE_RECOVERING: "↑", PHASE_CLOSED: "•",
+                PHASE_EVENT_RISK: "!", PHASE_NORMAL: ""}.get(r["phase"], "")
         rader.append({
             "": "▌",                       # statusspine
             "TICKER": r["Ticker"],
-            "NAVN": navn,
+            "FASE": fase,
             "STATUS": status,
             "CORR": r["correctionScore"],
             "TREND": r["trendScore"],
             "RECOV": r["recoveryScore"],
-            "KORR %": -cc.drawdownPct if cc else None,
+            "KORR %": -cc.currentDrawdownPct if cc else None,
             "PCTL": r["correctionPercentile"],
             "DAGER": cc.daysSincePeak if cc else None,
             "KURS": ind["close_now"],
@@ -2039,12 +2409,10 @@ def tabell_stil(df: pd.DataFrame, resultater: list):
 
     sty = df.style
     sty = sty.apply(lambda k: per_rad(k, lambda i: f"color: {farger[i]}"),
-                    subset=["", "STATUS", "CORR"])
+                    subset=["", "FASE", "STATUS", "CORR"])
     sty = sty.apply(lambda k: per_rad(
         k, lambda i: f"color: {DC['svak'] if dempet[i] else DC['tekst']}"),
         subset=["TICKER", "TREND", "RECOV", "PCTL", "DAGER", "KURS", "RSI"])
-    sty = sty.apply(lambda k: per_rad(k, lambda i: f"color: {DC['dempet']}"),
-                    subset=["NAVN"])
     sty = sty.apply(lambda k: per_rad(
         k, lambda i: f"color: {DC['svak'] if dempet[i] else DC['orange']}"),
         subset=["KORR %"])
@@ -2066,7 +2434,8 @@ def tabell_stil(df: pd.DataFrame, resultater: list):
 TABELL_KOLONNER = {
     "": st.column_config.TextColumn("", width=6),
     "TICKER": st.column_config.TextColumn("TICKER", width=72),
-    "NAVN": st.column_config.TextColumn("NAVN", width=170),
+    "FASE": st.column_config.TextColumn("F", width=26,
+                                        help="↓ faller · = bygger base · ↑ henter seg inn"),
     "STATUS": st.column_config.TextColumn("STATUS", width=150),
     "CORR": st.column_config.NumberColumn("CORR", width=58),
     "TREND": st.column_config.NumberColumn("TREND", width=62),
@@ -2174,6 +2543,8 @@ def kursgraf(r: dict, vindu: str = "KORREKSJON"):
         for etikett, dato, pris, farge in [
             ("TOPP", cc.peakDate, cc.peakPrice, "#8B95A5"),
             ("BUNN", cc.troughDate, cc.troughPrice, DC["roed"]),
+            ("NÅ", d["Dato"].iloc[-1].strftime("%Y-%m-%d"), cc.currentPrice,
+             STATUS_FARGE[r["status"]]),
         ]:
             ts = pd.Timestamp(dato)
             if ts >= d["Dato"].iloc[0]:
@@ -2260,7 +2631,7 @@ def panel_topp_html(r: dict) -> str:
       {f(d1, 2, ' %')}</span>
     <span style="flex:1;"></span>
     <span style="font-family:{MONO};font-size:13px;color:{DC['gul']};">
-      {f'-{f(cc.drawdownPct, 1)} % fra topp' if cc else '—'}</span>
+      {f'-{f(cc.currentDrawdownPct, 1)} % fra topp' if cc else '—'}</span>
   </div>
   {bar('CORRECTION', r['correctionScore'],
        f"{r['correctionScore']:.0f} · PCTL {r['correctionPercentile']:.0f}"
@@ -2269,6 +2640,12 @@ def panel_topp_html(r: dict) -> str:
   {bar('RECOVERY', r['recoveryScore'],
        f"{r['recoveryScore']:.0f} · {r['recoveryBand'].replace('RECOVERY', '').strip() or 'NONE'}",
        DC['gronn'])}
+  <div style="display:flex;gap:16px;margin-top:12px;font-family:{MONO};
+       font-size:10px;letter-spacing:0.08em;color:{DC['svak']};">
+    <span>FASE <span style="color:{DC['tekst']};">{cc.phase if cc else '—'}</span></span>
+    <span>SEVERITY <span style="color:{STATUS_FARGE[r['status']]};">{(cc.severity if cc else '—').replace('_', ' ')}</span></span>
+    <span>FART <span style="color:{DC['tekst']};">{f(cc.correctionVelocity, 2) if cc else '—'} %/d</span></span>
+  </div>
 </div>"""
 
 
@@ -2310,18 +2687,24 @@ def korreksjonsforlop_html(r: dict) -> str:
 
     w = SCANNER_CONFIG["correctionScoreWeights"]
     pil = f'<div style="color:{DC["kant"]};align-self:center;">→</div>'
-    stotte = (f'Nærmeste bekreftede swing-low {f(r["supportNivå"])}, '
-              f'{f(r["supportAvstandPct"], 2)} % fra kurs.'
-              if r.get("supportNivå") else "Ingen bekreftet swing-low funnet ennå.")
+    z = r.get("supportSone")
+    if z:
+        stotte = (f'<span style="font-family:{MONO};">Støttesone {f(z["nivå"])} '
+                  f'({f(z["avstandPct"], 1)} % under kurs, {z["treff"]} '
+                  f'reaksjon{"er" if z["treff"] > 1 else ""}: '
+                  f'{", ".join(z["kilder"])})</span>')
+    else:
+        stotte = (f'<span style="color:{DC["orange"]};">Ingen relevant støtte innen '
+                  f'{f(r["supportVindu"], 1)} % — støttekomponenten er 0.</span>')
 
     return (
         f'<div style="display:flex;gap:16px;flex-wrap:wrap;">'
-        f'{punkt("TOPP", f(cc.peakPrice), cc.peakDate)}{pil}'
-        f'{punkt("BUNN", f(cc.troughPrice), cc.troughDate, DC["roed"])}{pil}'
-        f'{punkt("NÅ", f(cc.currentPrice), f"{cc.daysSincePeak} dager siden topp")}</div>'
+        f'{punkt("TOPP", f(cc.peakPrice), f"{cc.peakDate} · {cc.daysSincePeak} d siden")}{pil}'
+        f'{punkt("BUNN", f(cc.troughPrice), f"{cc.troughDate} · {cc.daysPeakToTrough} d fall", DC["roed"])}{pil}'
+        f'{punkt("NÅ", f(cc.currentPrice), f"{cc.daysSinceTrough} d siden bunn")}</div>'
         f'<div style="margin-top:12px;font-size:12px;color:{DC["dempet"]};'
-        f'line-height:1.6;">Dybde topp→bunn <b>-{f(cc.maxDepthPct, 1)} %</b>, '
-        f'nå <b>-{f(cc.drawdownPct, 1)} %</b> fra topp. '
+        f'line-height:1.6;">Dybde topp→bunn <b>-{f(cc.maxDrawdownPct, 1)} %</b>, '
+        f'nå <b>-{f(cc.currentDrawdownPct, 1)} %</b> fra topp. '
         f'Correction Score {r["correctionScore"]:.0f} = percentil '
         f'{r["correctionPercentile"]:.0f} × {w["percentile"]:.0%} + stretch '
         f'{r["stretchScore"]:.0f} × {w["technicalStretch"]:.0%} + støtte '
@@ -2344,14 +2727,29 @@ def historikk_html(r: dict) -> str:
     if not h:
         return (f'<div style="color:{DC["svak"]};font-size:12px;">'
                 f'Ingen avsluttede korreksjoner funnet i historikken.</div>')
-    naa = r["currentCorrection"].maxDepthPct if r.get("currentCorrection") else None
+    cc = r.get("currentCorrection")
+    naa = cc.maxDrawdownPct if cc else None
     rader = []
-    if naa is not None:
+    if cc is not None:
+        # §26: den aktive korreksjonen vises med sin maksimale dybde, ikke
+        # med dagens drawdown — ellers krymper historikken når kursen henter
+        # seg inn og sammenligningen blir feil.
         rader.append(
-            f'<tr style="color:{DC["roed"]};"><td colspan="2" style="padding:6px 8px 6px 0;'
-            f'font-family:{MONO};font-size:11px;">NÅ</td>'
+            f'<tr style="color:{DC["roed"]};">'
+            f'<td style="padding:6px 8px 6px 0;font-family:{MONO};font-size:11px;">'
+            f'{cc.peakDate}</td>'
+            f'<td style="padding:6px 8px 6px 0;font-family:{MONO};font-size:11px;">'
+            f'{cc.troughDate}{"" if cc.barsSinceTrough > 0 else " (i dag)"}</td>'
             f'<td style="padding:6px 8px 6px 0;font-family:{MONO};font-size:12px;'
-            f'text-align:right;">-{naa:.1f} %</td><td colspan="2"></td></tr>')
+            f'text-align:right;">-{cc.maxDrawdownPct:.1f} %</td>'
+            f'<td style="padding:6px 8px 6px 0;font-family:{MONO};font-size:11px;'
+            f'text-align:right;">{cc.daysPeakToTrough} d</td>'
+            f'<td style="padding:6px 0;font-family:{MONO};font-size:11px;'
+            f'text-align:right;">NÅ</td></tr>'
+            f'<tr style="color:{DC["svak"]};"><td colspan="2" style="padding:0 8px 8px 0;'
+            f'font-size:11px;">Nå -{cc.currentDrawdownPct:.1f} % fra topp · '
+            f'{cc.daysSinceTrough} dager siden bunn</td>'
+            f'<td colspan="3"></td></tr>')
     for k in sorted(h, key=lambda x: -x.drawdownPct)[:30]:
         storre = naa is not None and k.drawdownPct > naa
         rader.append(
@@ -2435,7 +2833,7 @@ def kort_html(r: dict, form: str) -> str:
                 + (f' · {cc.daysSincePeak} dager siden topp' if cc and not dempet else '')
                 + f'</div><div>{badge(r["status"], kort=True)}{gate}</div>'
                 f'<div style="font-family:{MONO};font-size:15px;color:{DC["orange"] if not dempet else DC["svak"]};'
-                f'text-align:right;">{f"-{f(cc.drawdownPct, 1)} %" if cc else "—"}</div>'
+                f'text-align:right;">{f"-{f(cc.currentDrawdownPct, 1)} %" if cc else "—"}</div>'
                 + sc("CORR", r["correctionScore"]) + sc("TREND", r["trendScore"])
                 + sc("RECOV", r["recoveryScore"]) + '</div>')
 
@@ -2463,15 +2861,15 @@ def kort_html(r: dict, form: str) -> str:
             f' style="font-size:11px;color:{DC["blaa"]};text-decoration:none;">Yahoo ↗</a>'
             f'</div><div style="font-family:{MONO};font-size:12px;color:{DC["svak"]};'
             f'margin-top:4px;">{f(ind["close_now"])} · '
-            + (f'{cc.daysSincePeak} dager siden topp · korreksjon {_esc(cc.id)}' if cc else '—')
+            + (f'{cc.daysSincePeak} dager siden topp · korreksjon {_esc(cc.correctionId)}' if cc else '—')
             + f'</div></div><div style="text-align:right;">{badge(r["status"])}{gate}'
             + (f'<div style="font-family:{MONO};font-size:11px;color:{DC["svak"]};'
                f'margin-top:6px;">{detalj}</div>' if detalj else '')
             + f'</div></div>'
             f'<div style="display:grid;grid-template-columns:repeat(4,minmax(0,1fr));'
             f'gap:12px;margin-top:16px;">'
-            + maaler("KORREKSJON", f"-{f(cc.drawdownPct, 1)} %" if cc else "—",
-                     f"dybde -{f(cc.maxDepthPct, 1)} %" if cc else "",
+            + maaler("DRAWDOWN NÅ", f"-{f(cc.currentDrawdownPct, 1)} %" if cc else "—",
+                     f"max -{f(cc.maxDrawdownPct, 1)} %" if cc else "",
                      DC["roed"] if cc else None)
             + maaler("PERCENTIL", f"{r['correctionPercentile']:.0f}",
                      "tynn historikk" if r["tynnHistorikk"] else f"{r['antallHistoriske']} tidligere",
@@ -2487,7 +2885,7 @@ def sorter_resultater(resultater: list, valg: str) -> list:
     if valg == "Ticker":
         return sorted(resultater, key=lambda r: r["Ticker"])
     if valg == "Korreksjon %":
-        return sorted(resultater, key=lambda r: -(r["currentCorrection"].drawdownPct
+        return sorted(resultater, key=lambda r: -(r["currentCorrection"].currentDrawdownPct
                                                   if r.get("currentCorrection") else -999))
     felt = SORTERINGSVALG.get(valg)
     if felt:
@@ -2670,7 +3068,7 @@ def _fotnote() -> None:
         st.markdown(f"""
 **Kjerneprinsippet:** ingen felles prosentgrense. Hver aksje sammenlignes med sin egen
 historikk av korreksjoner, funnet med ATR-normalisert ZigZag
-(terskel {c['swingAtrMultiplier']} × ATR14). Et fall på 7 % kan være en stor DNB-korreksjon
+(terskel {c['swing']['atrMultiplier']} × ATR14). Et fall på 7 % kan være en stor DNB-korreksjon
 og samtidig helt normal NAS-støy.
 
 | Score | Spørsmål | Sammensetning |
@@ -2732,7 +3130,8 @@ def main() -> None:
         return
 
     prisdata = hent_prisdata(tuple(sorted(aktive)))
-    resultater = kjor_scan(prisdata, st.session_state.fundamentals) if prisdata else []
+    resultater = (kjor_scan(prisdata, st.session_state.fundamentals,
+                            st.session_state.radar_state) if prisdata else [])
 
     if not resultater:
         _sidepanel([])

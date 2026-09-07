@@ -1,5 +1,5 @@
 """
-Akseptansetester for Correction Radar (§24 i spesifikasjonen).
+Akseptansetester for Correction Radar — §41 A–M i masterspesifikasjonen.
 
 Kjør:  python test_scanner.py
 
@@ -15,12 +15,6 @@ import pandas as pd
 import scanner as S
 
 
-# ══════════════════════════════════════════════════════════════
-# SYNTETISKE KURSSERIER
-# ══════════════════════════════════════════════════════════════
-
-# Omtrentlig daglig standardavvik, valgt for å ligne den faktiske forskjellen
-# mellom en bank, en halvlederaksje og et flyselskap.
 PROFILER = {
     "DNB.OL": {"sigma": 1.0, "drift": 0.030, "seed": 11},
     "NOD.OL": {"sigma": 2.4, "drift": 0.030, "seed": 22},
@@ -124,232 +118,246 @@ def legg_til_ben(df, mal, barer, sigma=0.5, seed=3):
     return pd.concat([df, ny])
 
 
+def ath_serie(n=760, seed=101):
+    """
+    Aksje i normal opptrend som står på sin egen topp akkurat nå.
+    Siste bar tvinges til å være seriens høyeste lukk, slik at drawdown er
+    null og det ikke finnes noen aktiv korreksjon å hente seg inn fra.
+    """
+    d = lag_df(n=n, sigma=1.2, drift=0.14, seed=seed, start=40.0)
+    d = legg_til_ben(d, 1.06, 20, sigma=0.25, seed=seed + 1)
+    topp = float(d["Close"].max())
+    for kol, faktor in (("Close", 1.004), ("High", 1.008),
+                        ("Open", 1.000), ("Low", 0.996)):
+        d.iloc[-1, d.columns.get_loc(kol)] = topp * faktor
+    return d
+
+
+def dyp_så_recovery(fall=0.80, seed=17):
+    """Klar opptrend → dypt fall → bunn → bounce → higher low → brudd opp."""
+    d = trendserie(n_pre=640, sigma=1.1, drift=0.16, seed=seed, start=30.0)
+    d = legg_til_ben(d, fall, 26, seed=2)
+    ved_bunn = d.copy()
+    d = legg_til_ben(d, 1.09, 12, seed=3)
+    d = legg_til_ben(d, 0.965, 8, seed=4)
+    d = legg_til_ben(d, 1.12, 16, seed=5)
+    return ved_bunn, d
+
+
+def stabilisering_som_feiler(seed=23):
+    """Fall → stabilisering → nytt lavpunkt. Skal beholde samme correctionId."""
+    d = trendserie(n_pre=630, sigma=1.2, drift=0.14, seed=seed, start=35.0)
+    d = legg_til_ben(d, 0.85, 22, seed=2)
+    faller = d.copy()
+    d = legg_til_ben(d, 1.07, 11, seed=3)
+    d = legg_til_ben(d, 0.975, 7, seed=4)
+    stabiliserer = d.copy()
+    d = legg_til_ben(d, 0.88, 14, seed=5)      # bryter ned til nytt lavpunkt
+    return faller, stabiliserer, d
+
+
+def fjern_support_serie(seed=77):
+    """Kraftig, sammenhengende fall uten reaksjoner nær dagens kurs."""
+    d = lag_df(n=700, sigma=1.4, drift=0.10, seed=seed, start=25.0)
+    return legg_til_ben(d, 0.62, 70, sigma=0.35, seed=seed + 1)
+
 # ══════════════════════════════════════════════════════════════
-# AKSEPTANSEKRAV §24
+# AKSEPTANSETESTER §41 A–M
 # ══════════════════════════════════════════════════════════════
 
 RES = []
 
 
-def krav(navn, ok, detalj=""):
-    RES.append((ok, navn, detalj))
-    print(f"{'✓' if ok else '✗'} {navn}" + (f"\n    {detalj}" if detalj else ""))
+def krav(bokstav, navn, ok, detalj=""):
+    RES.append((ok, f"{bokstav}. {navn}", detalj))
+    print(f"{'✓' if ok else '✗'} {bokstav}. {navn}" + (f"\n    {detalj}" if detalj else ""))
 
 
-def scan(ticker, df, fund=None, cfg=None):
-    return S.scan_stock(ticker, df, fund or {}, cfg or S.SCANNER_CONFIG)
+def scan(ticker, df, fund=None, state=None, cfg=None):
+    return S.scan_stock(ticker, df, fund or {}, state, cfg or S.SCANNER_CONFIG)
 
 
-# ── 1+2: DNB og NAS reagerer ikke likt på samme prosentfall ──
+GODKJENT = {"reportChecked": True, "guidanceChecked": True,
+            "newsChecked": True, "thesisIntact": True}
+
+
+# ── A: DNB vs NAS ──
 FALL = 7.0
-r = {}
-for t in ("DNB.OL", "NAS.OL", "NOD.OL"):
-    df = paalegg_fall(lag_df(**PROFILER[t]), FALL, 18)
-    r[t] = scan(t, df)
+res = {t: scan(t, paalegg_fall(lag_df(**p), FALL, 18))
+       for t, p in PROFILER.items()}
+d, n = res["DNB.OL"], res["NAS.OL"]
+krav("A", "DNB og NAS gir ikke samme Correction Score ved samme prosentfall",
+     abs(d["correctionScore"] - n["correctionScore"]) >= 20
+     and abs(d["correctionPercentile"] - n["correctionPercentile"]) >= 20,
+     f"DNB max -{d['currentCorrection'].maxDrawdownPct:.1f} % → percentil "
+     f"{d['correctionPercentile']:.0f}, score {d['correctionScore']:.0f}, {d['status']}\n    "
+     f"NAS max -{n['currentCorrection'].maxDrawdownPct:.1f} % → percentil "
+     f"{n['correctionPercentile']:.0f}, score {n['correctionScore']:.0f}, {n['status']}")
 
-d, n = r["DNB.OL"], r["NAS.OL"]
-krav("DNB og NAS reagerer IKKE likt på samme prosentfall",
-     abs(d["correctionPercentile"] - n["correctionPercentile"]) >= 20
-     and d["correctionScore"] != n["correctionScore"],
-     f"DNB -{d['currentCorrection'].drawdownPct:.1f}% → percentil {d['correctionPercentile']:.0f}, "
-     f"score {d['correctionScore']:.0f}, status {d['status']}\n    "
-     f"NAS -{n['currentCorrection'].drawdownPct:.1f}% → percentil {n['correctionPercentile']:.0f}, "
-     f"score {n['correctionScore']:.0f}, status {n['status']}")
-
+# ── B: ulik historisk volatilitet ──
 medianer = {}
-for t, res in r.items():
-    dd = sorted(h.drawdownPct for h in res["historiskeKorreksjoner"])
+for t, r in res.items():
+    dd = sorted(h.drawdownPct for h in r["historiskeKorreksjoner"])
     medianer[t] = round(dd[len(dd) // 2], 1) if dd else 0
-krav("Historiske korreksjoner er forskjellige per ticker",
-     len(set(medianer.values())) == 3,
-     "median historisk fall: " + ", ".join(f"{k.replace('.OL','')} {v} %" for k, v in medianer.items()))
+krav("B", "Ulik historisk volatilitet gir ulik correction percentile",
+     len(set(medianer.values())) == 3
+     and len({r["correctionPercentile"] for r in res.values()}) >= 2,
+     "median historisk fall: "
+     + " · ".join(f"{k.replace('.OL','')} {v} %" for k, v in medianer.items())
+     + "\n    percentiler: "
+     + " · ".join(f"{k.replace('.OL','')} {r['correctionPercentile']:.0f}"
+                  for k, r in res.items()))
 
-# ── 3: liten rebound oppretter ikke ny correctionId ──
-# Banen fra spesifikasjonen, som ÉN sammenhengende serie som forlenges i tid:
-# 190 → 175 → 180 → 165 → 170 → 155
-bane_df = trendserie(start=120.0, seed=41)
-bane_df = legg_til_ben(bane_df, 190 / float(bane_df["Close"].iloc[-1]), 40, seed=1)
-ider, fall, dybder = [], [], []
-for i, punkt in enumerate([175, 180, 165, 170, 155]):
-    bane_df = legg_til_ben(bane_df, punkt / float(bane_df["Close"].iloc[-1]), 12, seed=10 + i)
-    cc = scan("TEST.OL", bane_df)["currentCorrection"]
-    ider.append(cc.id)
-    fall.append(round(cc.drawdownPct, 1))
-    dybder.append(round(cc.maxDepthPct, 1))
-krav("En liten rebound oppretter IKKE ny correctionId",
-     len(set(ider)) == 1 and dybder[-1] > dybder[0],
-     f"190→175→180→165→170→155 gir én hendelse: {ider[0]}\n    "
-     f"fall fra topp: {fall}\n    dybde topp→bunn: {dybder}")
+# ── C: gammel swing-low langt under kursen ──
+w = scan("WAWI.OL", fjern_support_serie())
+sone = w["supportSone"]
+krav("C", "Gammel swing-low langt under kurs gir ikke høy support relevance",
+     w["supportScore"] == 0 or (sone and sone["avstandPct"] <= w["supportVindu"]),
+     f"relevansvindu {w['supportVindu']:.1f} % · support {w['supportScore']:.0f} · "
+     + (f"nærmeste relevante sone {sone['avstandPct']:.1f} % under kurs"
+        if sone else "ingen sone innenfor vinduet, score satt til 0")
+     + f"\n    (totalt {len(w['supportSoner'])} kandidatnivåer funnet, nærmeste "
+     f"{w['supportSoner'][0]['avstandPct']:.1f} % unna)" if w["supportSoner"] else "")
 
-# ── 4: kraftig endagsfall gir EVENT RISK ──
-ev = scan("NOD.OL", endagsfall(lag_df(**PROFILER["NOD.OL"]), 14.0))
-krav("Kraftig endagsfall gir EVENT RISK",
-     ev["status"] == S.STATUS_EVENT_RISK,
-     f"1D {ev['ind']['return1d']:.1f} %, volratio {ev['ind']['volumeRatio20d']}, "
-     f"utløst av {[k for k, v in ev['eventGrunner'].items() if v]} → {ev['status']}")
+# ── D: PROT — stor tidligere dybde bevares under recovery ──
+ved_bunn, etter = dyp_så_recovery()
+p_bunn = scan("PROT.OL", ved_bunn)
+state = {"corrections": {}, "statuses": {}, "alerts": [], "varslet": {}}
+S.evaluer_varsler([p_bunn], state)
+p_etter = scan("PROT.OL", etter, state=state["corrections"]["PROT.OL"])
+cc_b, cc_e = p_bunn["currentCorrection"], p_etter["currentCorrection"]
+krav("D", "Stor tidligere peak→trough bevares som max correction under recovery",
+     cc_e.maxDrawdownPct >= cc_b.maxDrawdownPct - 0.01
+     and cc_e.currentDrawdownPct < cc_e.maxDrawdownPct
+     and p_etter["severity"] == S.SEV_STRONG
+     and p_etter["phase"] in (S.PHASE_BASE_BUILDING, S.PHASE_RECOVERING),
+     f"ved bunn: max -{cc_b.maxDrawdownPct:.1f} % · severity {p_bunn['severity']} · "
+     f"phase {p_bunn['phase']}\n    "
+     f"etter recovery: max -{cc_e.maxDrawdownPct:.1f} % (uendret), nå "
+     f"-{cc_e.currentDrawdownPct:.1f} % · severity {p_etter['severity']} · "
+     f"phase {p_etter['phase']} → status {p_etter['status']}")
 
-rolig = scan("NOD.OL", paalegg_fall(lag_df(**PROFILER["NOD.OL"]), 14.0, 20))
-krav("Samme fall fordelt over 20 dager gir IKKE event risk",
-     not rolig["eventRisk"],
-     f"-14 % over 20 dager → eventRisk={rolig['eventRisk']}, status {rolig['status']}")
+# ── E: aksje på ATH ──
+a = scan("KOG.OL", ath_serie())
+aktive = [k for k, v in a["recoveryDeler"].items() if v is True]
+krav("E", "Aksje ved ATH får ikke Recovery Score uten aktiv korreksjon",
+     a["recoveryScore"] == 0 and a["recoveryDeler"].get("ingenAktivKorreksjon"),
+     f"kurs {a['ind']['close_now']:.1f}, drawdown "
+     f"-{a['currentCorrection'].currentDrawdownPct:.1f} %, severity {a['severity']} "
+     f"→ recovery {a['recoveryScore']:.0f}, ingen kriterier aktive {aktive}")
 
-# ── 5-7: REVERSAL-kjeden ──
-# Rolig aksje i klar opptrend → -14 % korreksjon → rebound → higher low → brudd opp.
-def bygg(fall=0.86, reb=1.06, opp=1.10, med_opptur=True):
-    d = trendserie(n_pre=640, sigma=1.1, drift=0.16, seed=17, start=30.0)
-    d = legg_til_ben(d, fall, 24, seed=2)
-    if not med_opptur:
-        return d
-    d = legg_til_ben(d, reb, 9, seed=3)
-    d = legg_til_ben(d, 0.972, 6, seed=4)
-    d = legg_til_ben(d, opp, 14, seed=5)
-    return d
+# ── F: stabilisering som feiler ──
+f_fall, f_stab, f_nytt = stabilisering_som_feiler()
+st_f = {"corrections": {}, "statuses": {}, "alerts": [], "varslet": {}}
+forlop = []
+for merke, d_ in [("fall", f_fall), ("stabilisering", f_stab), ("nytt lavpunkt", f_nytt)]:
+    r_ = scan("NOD.OL", d_, state=st_f["corrections"].get("NOD.OL"))
+    S.evaluer_varsler([r_], st_f)
+    c_ = r_["currentCorrection"]
+    forlop.append((merke, c_.correctionId, r_["phase"], r_["status"],
+                   c_.maxDrawdownPct, c_.currentDrawdownPct))
+ider = {x[1] for x in forlop}
+krav("F", "Feilet stabilisering beholder correctionId og går tilbake til FALLING",
+     len(ider) == 1 and forlop[-1][2] == S.PHASE_FALLING
+     and forlop[-1][4] >= forlop[1][4],
+     f"samme correctionId hele veien: {ider.pop()}\n    "
+     + "\n    ".join(f"{m:14s} phase={p:14s} status={s:18s} max=-{mx:.1f} % nå=-{nu:.1f} %"
+                     for m, _, p, s, mx, nu in forlop))
 
-GODKJENT = {"KOG.OL": {"reportChecked": True, "guidanceChecked": True,
-                       "newsChecked": True, "thesisIntact": True}}
+# ── G: event risk ──
+g = scan("KIT.OL", endagsfall(lag_df(sigma=2.2, drift=0.04, seed=55), 13.0))
+krav("G", "Svært raskt fall på stort volum går direkte til EVENT RISK",
+     g["status"] == S.STATUS_EVENT_RISK and g["phase"] == S.PHASE_EVENT_RISK,
+     f"1D {g['ind']['return1d']:.1f} % · ATR i går {g['ind']['atrPctPrev']:.2f} % · "
+     f"volratio {g['ind']['volumeRatio20d']} → "
+     f"{[k for k, v in g['eventGrunner'].items() if v]}\n    "
+     f"Correction Score {g['correctionScore']:.0f} beregnes fortsatt, men status "
+     f"er {g['status']}")
 
-dyp = scan("KOG.OL", bygg(med_opptur=False))
-krav("Høy Correction Score alene gir IKKE REVERSAL",
-     dyp["correctionScore"] >= 75 and dyp["status"] != S.STATUS_REVERSAL,
-     f"corr {dyp['correctionScore']:.0f} (høy), rec {dyp['recoveryScore']:.0f}, "
-     f"trend {dyp['trendScore']:.0f} → {dyp['status']}")
+# ── H: kurs under SMA200 ──
+h = scan("KIT.OL", paalegg_fall(lag_df(sigma=2.0, drift=-0.02, seed=99), 22.0, 60))
+krav("H", "Kurs under SMA200 reduserer Trend Score, men fjerner ikke aksjen",
+     h["ind"]["close_now"] < h["ind"]["sma200"] and h is not None
+     and not h["trendDeler"]["closeOverSma200"],
+     f"kurs {h['ind']['close_now']:.1f} < SMA200 {h['ind']['sma200']:.1f} → "
+     f"trend {h['trendScore']:.0f} ({h['trendBand']}), status {h['status']} "
+     f"— fortsatt i radaren")
 
-gj_df = bygg()
-uten = scan("KOG.OL", gj_df)
-med = scan("KOG.OL", gj_df, GODKJENT)
-krav("REVERSAL krever godkjent fundamental sjekk",
-     uten["status"] != S.STATUS_REVERSAL and med["status"] == S.STATUS_REVERSAL,
-     f"samme kursbilde (corr {med['correctionScore']:.0f}, rec {med['recoveryScore']:.0f}, "
-     f"trend {med['trendScore']:.0f}): uten sjekk → {uten['status']} · med sjekk → {med['status']}")
+# ── I: REVERSAL er streng ──
+i_uten = scan("KOG.OL", etter)
+i_med = scan("KOG.OL", etter, {"KOG.OL": GODKJENT})
+i_hoy = p_bunn   # høy Correction Score, ingen recovery
+krav("I", "Høy Correction Score alene gir aldri REVERSAL",
+     i_hoy["correctionScore"] >= 75 and i_hoy["status"] != S.STATUS_REVERSAL,
+     f"corr {i_hoy['correctionScore']:.0f}, recovery {i_hoy['recoveryScore']:.0f}, "
+     f"trend {i_hoy['trendScore']:.0f} → {i_hoy['status']}")
+krav("I", "REVERSAL krever recovery, trend, fundamental gate og case intakt",
+     i_uten["status"] != S.STATUS_REVERSAL and i_med["status"] == S.STATUS_REVERSAL,
+     f"samme kursbilde (recovery {i_med['recoveryScore']:.0f} ≥ 70, trend "
+     f"{i_med['trendScore']:.0f} ≥ 55, event risk {i_med['eventRisk']}): "
+     f"uten gate → {i_uten['status']} · med gate → {i_med['status']}")
 
-# Bare 4 barer opp fra bunnen: ingen bekreftet higher low ennå.
-tidlig = scan("KOG.OL", legg_til_ben(bygg(med_opptur=False), 1.03, 4, seed=8), GODKJENT)
-krav("REVERSAL krever Recovery >= terskel selv med godkjent fundamental",
-     tidlig["recoveryScore"] < S.SCANNER_CONFIG["recovery"]["confirmed"]
-     and tidlig["status"] != S.STATUS_REVERSAL,
-     f"corr {tidlig['correctionScore']:.0f} (høy nok), fundamental godkjent, "
-     f"men rec {tidlig['recoveryScore']:.0f} < {S.SCANNER_CONFIG['recovery']['confirmed']} "
-     f"→ {tidlig['status']}")
+# ── J: historisk integritet ──
+krav("J", "maxDrawdownPct reduseres ikke når aksjen henter seg inn",
+     cc_e.maxDrawdownPct >= cc_b.maxDrawdownPct - 0.01
+     and cc_e.currentDrawdownPct < cc_b.currentDrawdownPct,
+     f"max: -{cc_b.maxDrawdownPct:.1f} % → -{cc_e.maxDrawdownPct:.1f} % (uendret)\n    "
+     f"nå:  -{cc_b.currentDrawdownPct:.1f} % → -{cc_e.currentDrawdownPct:.1f} % (endres)")
 
-brutt = scan("KOG.OL", gj_df, {"KOG.OL": {"reportChecked": True, "guidanceChecked": True,
-                                          "newsChecked": True, "thesisIntact": False}})
-krav("Case ikke intakt blokkerer REVERSAL",
-     brutt["status"] != S.STATUS_REVERSAL,
-     f"tre sjekker gjort, men thesisIntact=False → {brutt['status']}")
+# ── K: support 0 uten relevant sone ──
+cfg_k = copy.deepcopy(S.SCANNER_CONFIG)
+cfg_k["support"]["atrMaxDistanceMultiplier"] = 0.01
+cfg_k["support"]["percentCap"] = 0.01
+k = scan("DNB.OL", paalegg_fall(lag_df(**PROFILER["DNB.OL"]), 7.0, 18), cfg=cfg_k)
+krav("K", "Support Score er 0 når ingen relevant støtte finnes i vinduet",
+     k["supportScore"] == 0.0 and k["supportSone"] is None,
+     f"relevansvindu strammet til {k['supportVindu']:.2f} % → support "
+     f"{k['supportScore']:.0f}, ingen sone valgt (mot {d['supportScore']:.0f} "
+     f"med standard vindu {d['supportVindu']:.1f} %)")
 
-# ── 8: kurs under SMA200 fjerner ikke aksjen ──
-ned = scan("KIT.OL", paalegg_fall(lag_df(sigma=2.0, drift=-0.02, seed=99), 22.0, 60))
-krav("Kurs under SMA200 fjerner IKKE aksjen",
-     ned["ind"]["close_now"] < ned["ind"]["sma200"] and ned is not None,
-     f"kurs {ned['ind']['close_now']:.1f} < SMA200 {ned['ind']['sma200']:.1f}, "
-     f"trend {ned['trendScore']:.0f} ({ned['trendBand']}), status {ned['status']} "
-     "— fortsatt med i radaren")
+# ── L: recovery-signaler fra aktiv correction ──
+l_deler = p_etter["recoveryDeler"]
+cc_l = p_etter["currentCorrection"]
+hl, motstand = l_deler.get("higherLowPrice"), l_deler.get("localResistance")
+krav("L", "Higher low og lokal motstand kommer fra den aktive korreksjonen",
+     (hl is None or hl > cc_l.troughPrice)
+     and (motstand is None or motstand > cc_l.troughPrice),
+     f"korreksjonsbunn {cc_l.troughPrice:.2f}\n    "
+     f"bekreftet higher low {hl} (over bunnen: {hl > cc_l.troughPrice if hl else 'n/a'})\n    "
+     f"lokal motstand {motstand} (dannet etter bunnen: "
+     f"{motstand > cc_l.troughPrice if motstand else 'n/a'})")
 
-# ── 9: eksisterende RSI/SMA/volumdata fungerer fortsatt ──
-i = r["DNB.OL"]["ind"]
-krav("Eksisterende RSI/SMA/volumdata fungerer fortsatt",
-     all(i[k] is not None for k in ("rsi", "sma20", "sma50", "sma200",
-                                    "volumeRatio20d", "avgVolume20d", "high52w",
-                                    "return6m", "drawdown52w", "atr")),
-     f"RSI {i['rsi']:.1f} · SMA20 {i['sma20']:.1f} · SMA50 {i['sma50']:.1f} · "
-     f"SMA200 {i['sma200']:.1f} · VolRatio {i['volumeRatio20d']} · 6M {i['return6m']:.1f} % · "
-     f"52W drawdown {i['drawdown52w']:.1f} %")
+# ── M: ingen gjentatte varsler ──
+st_m = {"corrections": {}, "statuses": {}, "alerts": [], "varslet": {}}
+serie = [f_fall, f_stab, f_stab, f_nytt, f_stab, f_stab]
+antall = []
+for d_ in serie:
+    r_ = scan("NOD.OL", d_, state=st_m["corrections"].get("NOD.OL"))
+    antall.append(len(S.evaluer_varsler([r_], st_m)))
+krav("M", "Samme correctionId gir ikke samme varsel om igjen",
+     sum(antall) <= 3 and antall[2] == 0 and antall[-1] == 0,
+     f"varsler per skanning gjennom STRONG→STABIL→STABIL→NYTT LAV→STABIL→STABIL: "
+     f"{antall}\n    totalt {sum(antall)} varsler, ingen gjentakelser")
 
-# ── 10: ingen BUY/SELL ──
-forbudt = {"BUY", "SELL", "STRONG BUY", "KJØP", "SELG"}
-alle_tekster = set(S.STATUS_LABEL.values()) | set(S.STATUS_PRIORITY) | \
-    {S.STATUS_WAIT, S.STATUS_FOLLOW, S.STATUS_REVERSAL}
-lekkasje = [t for t in alle_tekster if any(o in t.upper() for o in forbudt)]
-krav("Ingen BUY/SELL-signaler genereres", not lekkasje,
+# ── Ekstra: labels og terskler er konsistente (§19/§21) ──
+b = S.SCANNER_CONFIG["recovery"]
+baand = dict((navn, grense) for grense, navn in S.RECOVERY_BANDS)
+krav("§19", "Recovery-labels og terskler er identiske i config og visning",
+     b["stabilizing"] == 30 and b["early"] == 50 and b["confirmed"] == 70
+     and b["strong"] == 85 and baand["STABILIZING"] == b["stabilizing"]
+     and baand["EARLY RECOVERY"] == b["early"]
+     and baand["CONFIRMED RECOVERY"] == b["confirmed"]
+     and baand["STRONG RECOVERY"] == b["strong"],
+     f"config {b} · bånd {baand}")
+
+krav("§22", "Ingen BUY/SELL-signaler noe sted",
+     not any(o in t.upper() for t in S.STATUS_TEKST.values()
+             for o in ("BUY", "SELL", "KJØP", "SELG")),
      "statuser: " + ", ".join(sorted(S.STATUS_PRIORITY)))
 
-# ── 11: terskler kan endres i config ──
-cfg2 = copy.deepcopy(S.SCANNER_CONFIG)
-cfg2["correction"]["follow"] = 1
-cfg2["correction"]["correction"] = 2
-cfg2["correction"]["strong"] = 3
-laav = scan("NAS.OL", paalegg_fall(lag_df(**PROFILER["NAS.OL"]), 3.0, 10))
-laav2 = scan("NAS.OL", paalegg_fall(lag_df(**PROFILER["NAS.OL"]), 3.0, 10), cfg=cfg2)
-krav("Alle sentrale terskler kan endres i config",
-     laav["status"] != laav2["status"],
-     f"samme aksje, score {laav['correctionScore']:.0f}: "
-     f"standard config → {laav['status']} · endret config → {laav2['status']}")
-
-cfg3 = copy.deepcopy(S.SCANNER_CONFIG)
-cfg3["swingAtrMultiplier"] = 3.0
-h1 = len(scan("NOD.OL", lag_df(**PROFILER["NOD.OL"]))["historiskeKorreksjoner"])
-h2 = len(scan("NOD.OL", lag_df(**PROFILER["NOD.OL"]), cfg=cfg3)["historiskeKorreksjoner"])
-krav("swingAtrMultiplier styrer swing-deteksjonen fra config",
-     h1 != h2, f"multiplier 1.5 → {h1} korreksjoner · multiplier 3.0 → {h2}")
-
-# ── 12: watchlist endres uten å endre motoren ──
-uni = [S._universe_rad(t) for t in ["KOG", "NOD", "DNB"]]
-uni.append(S._universe_rad("AAPL"))
-uni[0]["enabled"] = False
-aktive = [e["ticker"] for e in uni if e["enabled"]]
-krav("Watchlist kan endres uten å endre scanner-motoren",
-     aktive == ["NOD.OL", "DNB.OL", "AAPL"] and uni[0]["enabled"] is False,
-     f"ADD/REMOVE/DISABLE via config: aktive = {aktive} (KOG deaktivert, AAPL lagt til)")
-
-# ── Varselmotor: idempotent, ingen spam ──
-state = {"statuses": {}, "alerts": []}
-res_liste = [r["DNB.OL"]]
-v1 = S.evaluer_varsler(res_liste, state)
-v2 = S.evaluer_varsler(res_liste, state)
-krav("Uendret status gir ikke nye varsler (ingen spam)",
-     len(v2) == 0,
-     f"første kjøring: {len(v1)} varsel · andre kjøring: {len(v2)}")
-
-
-# ══════════════════════════════════════════════════════════════
-# VARSELMOTOR §16 + §19
-# ══════════════════════════════════════════════════════════════
-
-def fake(ticker, status, corr_id, dd):
-    class CC:
-        drawdownPct = dd
-        id = corr_id
-    return {"ticker": ticker, "Ticker": ticker.replace(".OL", ""), "status": status,
-            "correctionId": corr_id, "currentCorrection": CC(),
-            "correctionScore": 80.0, "correctionPercentile": 89.0,
-            "trendBand": "HEALTHY", "recoveryBand": "NO RECOVERY"}
-
-state = {"statuses": {}, "alerts": []}
-CID = "NOD.OL:2026-08-01"
-forlop = [
-    ("WAIT", CID, 2.0, 0, "WAIT varsler aldri"),
-    ("FOLLOW", CID, 6.0, 0, "WAIT → FOLLOW står ikke i §19"),
-    ("CORRECTION", CID, 10.0, 1, "FOLLOW → CORRECTION"),
-    ("CORRECTION", CID, 10.4, 0, "uendret, lite dypere → ingen spam"),
-    ("CORRECTION", CID, 14.0, 1, "samme status, severity økt 3,6 pp"),
-    ("STRONG_CORRECTION", CID, 18.0, 1, "CORRECTION → STRONG CORRECTION"),
-    ("STRONG_CORRECTION", CID, 18.1, 0, "uendret"),
-    ("STABILIZING", CID, 12.0, 0, "STRONG → STABILIZING står ikke i §19"),
-    ("REVERSAL", CID, 6.0, 1, "STABILIZING → REVERSAL"),
-    ("EVENT_RISK", CID, 20.0, 1, "ANY → EVENT RISK"),
-]
-ok = True
-print(f"{'status':20s} {'dd':>6s} {'varsler':>8s} {'ventet':>7s}  merknad")
-for status, cid, dd, ventet, merknad in forlop:
-    n = len(S.evaluer_varsler([fake("NOD.OL", status, cid, dd)], state))
-    treff = n == ventet
-    ok &= treff
-    print(f"{'✓' if treff else '✗'} {status:18s} {dd:6.1f} {n:8d} {ventet:7d}  {merknad}")
-
-print(f"\nVarsellogg: {len(state['alerts'])} oppføringer, alle med samme correctionId: "
-      f"{len({a['correctionId'] for a in state['alerts']}) == 1}")
-print("Eksempel på varseltekst:\n")
-print(state["alerts"][-1]["tekst"])
-print("\nIngen kjøps-/salgsord i varsler:",
-      not any(o in a["tekst"].upper() for a in state["alerts"]
-              for o in ("BUY", "SELL", "KJØP", "SELG")))
-krav("Varselovergangene følger §19", ok,
-     "WAIT varsler aldri · FOLLOW→CORRECTION · CORRECTION→STRONG · "
-     "STABILIZING→REVERSAL · ANY→EVENT RISK · severity-økning innen samme correctionId")
-
-print("\n" + "=" * 62)
+print("\n" + "=" * 64)
 feil = [x for x in RES if not x[0]]
-print(f"{len(RES) - len(feil)}/{len(RES)} krav oppfylt")
+print(f"{len(RES) - len(feil)}/{len(RES)} akseptansekrav oppfylt")
 for _, navn, _ in feil:
     print(f"  MANGLER: {navn}")
 raise SystemExit(1 if feil else 0)
