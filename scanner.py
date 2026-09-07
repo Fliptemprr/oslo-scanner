@@ -20,6 +20,7 @@ from streamlit_autorefresh import st_autorefresh
 import pandas as pd
 import numpy as np
 import yfinance as yf
+import html as html_lib
 import json
 import math
 import time
@@ -1413,6 +1414,19 @@ VARSEL_OVERGANGER = {
 }
 
 
+def _varselsammendrag(r: dict, fra: Optional[str] = None) -> str:
+    """Én linje til varselpanelet."""
+    cc = r.get("currentCorrection")
+    biter = []
+    if fra:
+        biter.append(f"fra {fra.replace('_', ' ')}")
+    if cc:
+        biter.append(f"-{cc.drawdownPct:.1f} %")
+    biter.append(f"percentil {r['correctionPercentile']:.0f}")
+    biter.append(f"Trend {r['trendBand']}")
+    return " · ".join(biter)
+
+
 def _varseltekst(r: dict, tittel: str) -> str:
     cc = r.get("currentCorrection")
     fall = f"{cc.drawdownPct:.1f} %" if cc else "—"
@@ -1451,10 +1465,12 @@ def evaluer_varsler(resultater: list, state: dict, cfg: dict = SCANNER_CONFIG) -
             if ny_status == STATUS_EVENT_RISK:
                 nye.append({"tid": naa, "ticker": r["Ticker"], "type": "EVENT_RISK",
                             "correctionId": r["correctionId"],
+                            "sammendrag": _varselsammendrag(r),
                             "tekst": _varseltekst(r, "EVENT RISK – UNDERSØK")})
             elif (forrige_status, ny_status) in VARSEL_OVERGANGER:
                 nye.append({"tid": naa, "ticker": r["Ticker"], "type": ny_status,
                             "correctionId": r["correctionId"],
+                            "sammendrag": _varselsammendrag(r, forrige_status),
                             "tekst": _varseltekst(r, ny_status.replace("_", " "))})
 
         elif (ny_status == forrige_status
@@ -1464,6 +1480,7 @@ def evaluer_varsler(resultater: list, state: dict, cfg: dict = SCANNER_CONFIG) -
               and ny_status not in (STATUS_WAIT, STATUS_FOLLOW)):
             nye.append({"tid": naa, "ticker": r["Ticker"], "type": f"{ny_status}+",
                         "correctionId": r["correctionId"],
+                        "sammendrag": f"severity økt · {_varselsammendrag(r)}",
                         "tekst": _varseltekst(r, f"{ny_status.replace('_', ' ')} – severity økt")})
 
         statuses[t] = {
@@ -1596,49 +1613,64 @@ def kjor_scan(prisdata: dict, fund_store: dict, cfg: dict = SCANNER_CONFIG) -> l
 
 
 # ══════════════════════════════════════════════════════════════
-# UI
+# DESIGN TOKENS – hentet fra mockupen «1b TRIAGE»
 # ══════════════════════════════════════════════════════════════
 
-SORTERINGSVALG = {
-    "Prioritet (status)": None,
-    "Correction Score": "correctionScore",
-    "Recovery Score": "recoveryScore",
-    "Trend Score": "trendScore",
-    "Korreksjon %": "korreksjonPct",
-    "Ticker": "Ticker",
+DC = {
+    "bg": "#101216",
+    "kort": "#14171C",
+    "inset": "#0D0F13",
+    "rail": "#0C0E11",
+    "linje": "#23272F",
+    "linjeSvak": "#1C2027",
+    "kant": "#2B313A",
+    "tekst": "#ECEEF2",
+    "dempet": "#79828F",
+    "dempet2": "#9AA3B0",
+    "svak": "#6A7280",
+    "blaa": "#4DA3FF",
+    "gronn": "#2FD48F",
+    "roed": "#FF5B6A",
+    "orange": "#FF9130",
+    "gul": "#E8C547",
 }
 
+MONO = "'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace"
+SANS = "'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
+DISPLAY = "'Space Grotesk', 'IBM Plex Sans', sans-serif"
 
-def sorter_resultater(resultater: list, valg: str) -> list:
-    """Standard: det som krever oppmerksomhet først."""
-    if valg == "Ticker":
-        return sorted(resultater, key=lambda r: r["Ticker"])
-    if valg == "Korreksjon %":
-        return sorted(resultater, key=lambda r: -(r["currentCorrection"].drawdownPct
-                                                  if r.get("currentCorrection") else -999))
-    felt = SORTERINGSVALG.get(valg)
-    if felt:
-        return sorted(resultater, key=lambda r: -r[felt])
-    return sorted(resultater, key=lambda r: (
-        STATUS_PRIORITY.get(r["status"], 99), -r["correctionScore"]
-    ))
+STATUS_FARGE = {
+    STATUS_EVENT_RISK: DC["roed"],
+    STATUS_REVERSAL: DC["gronn"],
+    STATUS_STABILIZING: DC["blaa"],
+    STATUS_STRONG_CORRECTION: DC["orange"],
+    STATUS_CORRECTION: DC["gul"],
+    STATUS_FOLLOW: "#A5AFBF",
+    STATUS_WAIT: "#6B7686",
+}
 
+STATUS_TEKST = {
+    STATUS_EVENT_RISK: "EVENT RISK",
+    STATUS_REVERSAL: "REVERSAL",
+    STATUS_STABILIZING: "STABILIZING",
+    STATUS_STRONG_CORRECTION: "STRONG CORRECTION",
+    STATUS_CORRECTION: "CORRECTION",
+    STATUS_FOLLOW: "FOLLOW",
+    STATUS_WAIT: "WAIT",
+}
 
-def f(v: Optional[float], desimaler: int = 2, suffix: str = "") -> str:
-    """Formater tall for visning. None blir «—»."""
-    if v is None or (isinstance(v, float) and not math.isfinite(v)):
-        return "—"
-    return f"{v:,.{desimaler}f}".replace(",", " ") + suffix
+STATUS_KORT = {**STATUS_TEKST, STATUS_STRONG_CORRECTION: "STRONG CORR"}
 
-
-def _sjekkliste(navn: str, deler: dict, poeng: dict, etiketter: dict) -> None:
-    """Vis hvilke delkriterier som slo til, og med hvor mye."""
-    linjer = []
-    for nøkkel, etikett in etiketter.items():
-        truffet = bool(deler.get(nøkkel))
-        linjer.append(f"| {'✅' if truffet else '⬜'} | {etikett} | {poeng[nøkkel] if truffet else 0} / {poeng[nøkkel]} |")
-    st.markdown(f"**{navn}**\n\n| | Kriterium | Poeng |\n|---|---|---|\n" + "\n".join(linjer))
-
+# Tre soner ovenfra og ned. Rekkefølgen inni hver sone følger
+# STATUS_PRIORITY, så §18 styrer fortsatt sorteringen.
+SONER = [
+    {"navn": "KREVER GJENNOMGANG", "farge": DC["roed"], "form": "stor",
+     "statuser": [STATUS_EVENT_RISK, STATUS_REVERSAL]},
+    {"navn": "FØLG", "farge": DC["blaa"], "form": "medium",
+     "statuser": [STATUS_STABILIZING, STATUS_STRONG_CORRECTION, STATUS_CORRECTION]},
+    {"navn": "ROLIG", "farge": DC["svak"], "form": "kompakt",
+     "statuser": [STATUS_FOLLOW, STATUS_WAIT]},
+]
 
 TREND_ETIKETTER = {
     "closeOverSma200": "Kurs over SMA200",
@@ -1660,37 +1692,589 @@ RECOVERY_ETIKETTER = {
 }
 
 EVENT_ETIKETTER = {
-    "abnormal1D": "Unormalt 1D-fall",
-    "abnormal3D": "Unormalt 3D-fall",
-    "abnormalVolume": "Fall på unormalt volum",
-    "abnormalGap": "Unormalt gap ned",
+    "abnormal1D": "unormalt 1D-fall",
+    "abnormal3D": "unormalt 3D-fall",
+    "abnormalVolume": "fall på unormalt volum",
+    "abnormalGap": "unormalt gap ned",
+}
+
+SORTERINGSVALG = {
+    "PRIORITET": None,
+    "CORRECTION SCORE": "correctionScore",
+    "RECOVERY SCORE": "recoveryScore",
+    "TREND SCORE": "trendScore",
+    "KORREKSJON %": "korreksjon",
+    "TICKER": "Ticker",
 }
 
 
-def _render_fundamental(r: dict, fund_store: dict) -> bool:
-    """Fundamental gate. Returnerer True hvis noe ble endret."""
+def _rgba(hex_farge: str, alpha: float) -> str:
+    h = hex_farge.lstrip("#")
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return f"rgba({r},{g},{b},{alpha})"
+
+
+# ══════════════════════════════════════════════════════════════
+# CSS
+# Streamlit-chrome tones ned og widgets tilpasses terminal-temaet.
+# Alle selektorer bruker data-testid eller st-key-*, som er de
+# stabile krokene på tvers av Streamlit-versjoner.
+# ══════════════════════════════════════════════════════════════
+
+def injiser_css() -> None:
+    st.markdown(f"""
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  .stApp {{ background: {DC['bg']}; }}
+  html, body, [class*="css"] {{ font-family: {SANS}; color: {DC['tekst']}; }}
+
+  /* Streamlit-chrome vekk */
+  #MainMenu, footer, header [data-testid="stStatusWidget"] {{ visibility: hidden; }}
+  [data-testid="stDecoration"] {{ display: none; }}
+  [data-testid="stAppViewBlockContainer"] {{ padding: 1.6rem 2.2rem 4rem; max-width: 1500px; }}
+  [data-testid="stVerticalBlock"] {{ gap: 0.55rem; }}
+  [data-testid="stHorizontalBlock"] {{ gap: 0.9rem; }}
+
+  /* Knapper */
+  .stButton > button {{
+    background: transparent; border: 1px solid {DC['kant']}; color: {DC['dempet']};
+    border-radius: 8px; font-family: {MONO}; font-size: 11px; letter-spacing: 0.06em;
+    padding: 8px 14px; transition: none;
+  }}
+  .stButton > button:hover {{ border-color: {DC['blaa']}; color: {DC['blaa']}; }}
+  .stButton > button[kind="primary"] {{
+    background: {DC['gronn']}; border: none; color: #06180F; font-weight: 600;
+    border-radius: 999px; padding: 9px 18px;
+  }}
+  .stButton > button[kind="primary"]:hover {{ background: #4AE0A2; color: #06180F; }}
+
+  /* Segmented control / pills */
+  [data-testid="stSegmentedControl"] button {{
+    font-family: {MONO}; font-size: 11px; letter-spacing: 0.06em;
+    background: transparent; color: {DC['dempet']}; border-color: {DC['kant']};
+  }}
+  [data-testid="stSegmentedControl"] button[aria-checked="true"] {{
+    background: #ECEEF2; color: {DC['bg']};
+  }}
+
+  /* Selectbox */
+  [data-testid="stSelectbox"] div[data-baseweb="select"] > div {{
+    background: transparent; border-color: {DC['kant']}; border-radius: 8px;
+    font-family: {MONO}; font-size: 11px; color: {DC['dempet']}; min-height: 34px;
+  }}
+  [data-testid="stSelectbox"] label {{
+    font-family: {MONO}; font-size: 10px; letter-spacing: 0.12em; color: {DC['dempet']};
+  }}
+  div[data-baseweb="popover"] li {{ font-family: {MONO}; font-size: 12px; }}
+
+  /* Checkbox – fundamental gate */
+  [data-testid="stCheckbox"] label {{ font-size: 12px; color: {DC['dempet2']}; gap: 8px; }}
+  [data-testid="stCheckbox"] label span[data-baseweb="checkbox"] div:first-child {{
+    background: {DC['inset']}; border-color: {DC['kant']}; border-radius: 4px;
+  }}
+
+  /* Expander – DETALJER */
+  [data-testid="stExpander"] {{ border: none; background: transparent; }}
+  [data-testid="stExpander"] details {{
+    border: 1px solid {DC['kant']}; border-radius: 8px; background: transparent;
+  }}
+  [data-testid="stExpander"] summary {{
+    font-family: {MONO}; font-size: 11px; letter-spacing: 0.06em; color: {DC['dempet']};
+    padding: 9px 14px;
+  }}
+  [data-testid="stExpander"] summary:hover {{ color: {DC['blaa']}; }}
+
+  /* Faner inne i detaljer */
+  [data-testid="stTabs"] button {{
+    font-family: {MONO}; font-size: 10px; letter-spacing: 0.1em; color: {DC['dempet']};
+  }}
+  [data-testid="stTabs"] button[aria-selected="true"] {{ color: {DC['tekst']}; }}
+  [data-testid="stTabs"] [data-baseweb="tab-highlight"] {{ background: {DC['blaa']}; }}
+
+  /* Fundamental-widgets pakkes tett inn i kortet over */
+  [class*="st-key-gate-"] {{
+    background: {DC['inset']}; border: 1px solid {DC['linje']};
+    border-radius: 10px; padding: 10px 14px 4px; margin-top: -6px;
+  }}
+  [class*="st-key-rail-"] [data-testid="stCheckbox"] label {{ font-size: 11px; }}
+
+  /* Skjuler tomme markdown-wrappere som ellers lager luft */
+  [data-testid="stMarkdown"]:empty {{ display: none; }}
+
+  /* Scrollbar */
+  ::-webkit-scrollbar {{ width: 10px; height: 10px; }}
+  ::-webkit-scrollbar-track {{ background: {DC['bg']}; }}
+  ::-webkit-scrollbar-thumb {{ background: {DC['kant']}; border-radius: 5px; }}
+</style>
+""", unsafe_allow_html=True)
+
+
+# ══════════════════════════════════════════════════════════════
+# HTML-KOMPONENTER
+# ══════════════════════════════════════════════════════════════
+
+def f(v: Optional[float], desimaler: int = 2, suffix: str = "") -> str:
+    """Formater tall for visning. None blir «—»."""
+    if v is None or (isinstance(v, float) and not math.isfinite(v)):
+        return "—"
+    return f"{v:,.{desimaler}f}".replace(",", " ") + suffix
+
+
+def _esc(s: Any) -> str:
+    return html_lib.escape(str(s))
+
+
+def badge(status: str, kort: bool = False, stor: bool = False) -> str:
+    """Statusbadge. Erstatter emoji-prikkene fra forrige versjon."""
+    farge = STATUS_FARGE[status]
+    tekst = (STATUS_KORT if kort else STATUS_TEKST)[status]
+    if stor:
+        return (f'<span style="display:inline-flex;align-items:center;background:{farge};'
+                f'color:{DC["bg"]};border-radius:999px;padding:7px 14px;font-family:{MONO};'
+                f'font-size:12px;font-weight:600;letter-spacing:0.08em;">{tekst}</span>')
+    if status == STATUS_WAIT:
+        return (f'<span style="font-family:{MONO};font-size:10px;letter-spacing:0.08em;'
+                f'color:{farge};border:1px solid {DC["kant"]};padding:3px 7px;'
+                f'border-radius:3px;white-space:nowrap;">{tekst}</span>')
+    return (f'<span style="font-family:{MONO};font-size:10px;letter-spacing:0.08em;'
+            f'color:{farge};border:1px solid {_rgba(farge, 0.38)};'
+            f'background:{_rgba(farge, 0.11)};padding:3px 7px;border-radius:3px;'
+            f'white-space:nowrap;">{tekst}</span>')
+
+
+def sone_header(navn: str, farge: str, antall: int) -> str:
+    grad = (f"linear-gradient(90deg, {_rgba(farge, 0.4)}, transparent)"
+            if navn != "ROLIG" else DC["linje"])
+    return (f'<div style="display:flex;align-items:center;gap:10px;margin:14px 0 10px;">'
+            f'<div style="font-family:{MONO};font-size:11px;letter-spacing:0.14em;'
+            f'color:{farge};">{navn} · {antall}</div>'
+            f'<div style="flex:1;height:1px;background:{grad};"></div></div>')
+
+
+def _maalerblokk(etikett: str, verdi: str, under: str,
+                 verdifarge: str = None, underfarge: str = None) -> str:
+    return (f'<div style="background:{DC["inset"]};border:1px solid {DC["linje"]};'
+            f'border-radius:10px;padding:14px;">'
+            f'<div style="font-family:{MONO};font-size:10px;letter-spacing:0.1em;'
+            f'color:{DC["dempet"]};">{etikett}</div>'
+            f'<div style="font-family:{MONO};font-size:28px;line-height:1.2;'
+            f'color:{verdifarge or DC["tekst"]};">{verdi}</div>'
+            f'<div style="font-family:{MONO};font-size:11px;'
+            f'color:{underfarge or DC["dempet"]};">{under}</div></div>')
+
+
+def reversal_blokkert(r: dict, cfg: dict = SCANNER_CONFIG) -> bool:
+    """
+    Aksjen oppfyller alle tekniske REVERSAL-krav, men mangler fundamental
+    godkjenning. Statusmotoren lar den da falle gjennom til FOLLOW (§15), så
+    uten dette flagget ville den havnet i den rolige sonen ett hakemerke unna
+    REVERSAL, uten synlig grunn.
+    """
+    return (r["correctionScore"] >= cfg["correction"]["correction"]
+            and r["recoveryScore"] >= cfg["recovery"]["confirmed"]
+            and r["trendScore"] >= cfg["trend"]["minimumForReversal"]
+            and not (r["fundamentalsChecked"] and r["thesisIntact"]))
+
+
+def gate_pille() -> str:
+    return (f'<span style="font-family:{MONO};font-size:9px;letter-spacing:0.08em;'
+            f'color:{DC["orange"]};border:1px solid {_rgba(DC["orange"], 0.35)};'
+            f'background:{_rgba(DC["orange"], 0.1)};padding:2px 6px;border-radius:3px;'
+            f'margin-left:8px;white-space:nowrap;">GATE</span>')
+
+
+def event_detalj(r: dict) -> str:
+    """Kort forklaring på hva som utløste event risk, som i mockupen."""
+    ind, g = r["ind"], r["eventGrunner"]
+    biter = []
+    if g.get("abnormalGap") and ind.get("gapDownPct") is not None:
+        biter.append(f'GAP NED {f(ind["gapDownPct"], 1)} %')
+    if g.get("abnormal1D") and ind.get("return1d") is not None:
+        biter.append(f'1D {f(ind["return1d"], 1)} %')
+    if g.get("abnormal3D") and ind.get("return3d") is not None:
+        biter.append(f'3D {f(ind["return3d"], 1)} %')
+    if g.get("abnormalVolume") and ind.get("volumeRatio20d") is not None:
+        biter.append(f'VOL {f(ind["volumeRatio20d"], 1)}×')
+    return " · ".join(biter)
+
+
+def stort_kort_html(r: dict) -> str:
+    """Sone 1: full bredde, status som overskrift, fire målerblokker."""
+    ind, cc = r["ind"], r.get("currentCorrection")
+    farge = STATUS_FARGE[r["status"]]
+
+    meta = [f'{f(ind["close_now"])}']
+    if ind.get("return1d") is not None:
+        rf = DC["gronn"] if ind["return1d"] >= 0 else DC["roed"]
+        meta[0] += f' <span style="color:{rf};">{f(ind["return1d"], 2, " %")}</span>'
+    if cc:
+        meta.append(f"{cc.daysSincePeak} dager siden topp")
+        if cc.recoveryPct > 0.5:
+            meta.append(f"opp {f(cc.recoveryPct, 1)} % fra bunn")
+        meta.append(f"korreksjon {_esc(cc.id)}")
+
+    detalj = event_detalj(r) if r["eventRisk"] else (
+        f"FUNDAMENTAL {sum([r['fundamental'].reportChecked, r['fundamental'].guidanceChecked, r['fundamental'].newsChecked, r['fundamental'].thesisIntact])}/4"
+    )
+
+    maalere = "".join([
+        _maalerblokk("KORREKSJON",
+                     f"-{f(cc.drawdownPct, 1)} %" if cc else "—",
+                     f"dybde -{f(cc.maxDepthPct, 1)} %" if cc else "",
+                     DC["roed"] if cc and cc.drawdownPct > 0 else None),
+        _maalerblokk("PERCENTIL", f"{r['correctionPercentile']:.0f}",
+                     "tynn historikk" if r["tynnHistorikk"]
+                     else f"{r['antallHistoriske']} tidligere",
+                     underfarge=DC["orange"] if r["tynnHistorikk"] else None),
+        _maalerblokk("TREND", f"{r['trendScore']:.0f}", r["trendBand"],
+                     underfarge=DC["gronn"] if r["trendScore"] >= 60 else DC["orange"]),
+        _maalerblokk("RECOVERY", f"{r['recoveryScore']:.0f}", r["recoveryBand"],
+                     underfarge=DC["gronn"] if r["recoveryScore"] >= 50 else DC["roed"]),
+    ])
+
+    gate = ""
+    if not r["fundamentalsChecked"]:
+        antall = sum([r["fundamental"].reportChecked,
+                      r["fundamental"].guidanceChecked, r["fundamental"].newsChecked])
+        gate = (f'<div style="display:flex;gap:10px;align-items:flex-start;'
+                f'background:{_rgba(DC["orange"], 0.07)};border:1px solid {_rgba(DC["orange"], 0.25)};'
+                f'border-radius:8px;padding:10px 12px;">'
+                f'<span style="font-family:{MONO};font-size:10px;letter-spacing:0.1em;'
+                f'color:{DC["orange"]};">GATE</span>'
+                f'<span style="font-size:12px;color:{DC["dempet2"]};line-height:1.5;">'
+                f'Fundamental sjekk ikke fullført — REVERSAL er blokkert. '
+                f'{antall} av 3 punkter avkrysset.</span></div>')
+    elif r["fundamental"].stale:
+        gate = (f'<div style="font-size:12px;color:{DC["orange"]};">'
+                f'Forrige fundamentale sjekk gjaldt en tidligere korreksjon og er nullstilt.</div>')
+
+    return f"""
+<div style="border:1px solid {_rgba(farge, 0.35)};
+     background:linear-gradient(180deg, {_rgba(farge, 0.09)}, {_rgba(farge, 0.02)});
+     border-radius:12px;padding:20px;display:flex;flex-direction:column;gap:18px;">
+  <div style="display:flex;align-items:flex-start;gap:16px;">
+    <div style="flex:1;min-width:0;">
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+        <span style="font-family:{DISPLAY};font-size:26px;font-weight:600;
+              letter-spacing:-0.01em;color:{DC['tekst']};">{_esc(r['Ticker'])}</span>
+        <span style="font-size:13px;color:{DC['dempet2']};">{_esc(r['Navn'])}</span>
+        <a href="https://finance.yahoo.com/quote/{_esc(r['ticker'])}" target="_blank"
+           style="font-size:11px;color:{DC['blaa']};text-decoration:none;">Yahoo ↗</a>
+      </div>
+      <div style="font-family:{MONO};font-size:12px;color:{DC['dempet']};margin-top:4px;">
+        {' · '.join(meta)}
+      </div>
+    </div>
+    <div style="text-align:right;">
+      {badge(r['status'], stor=True)}
+      <div style="font-family:{MONO};font-size:11px;color:{DC['dempet']};margin-top:6px;">
+        {detalj}</div>
+    </div>
+  </div>
+  <div style="display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;">
+    {maalere}
+  </div>
+  {gate}
+</div>"""
+
+
+def medium_rad_html(r: dict) -> str:
+    """Sone 2: én linje per aksje med de tre scorene."""
+    cc = r.get("currentCorrection")
+    farge = STATUS_FARGE[r["status"]]
+    dager = f" · {cc.daysSincePeak} dager siden topp" if cc else ""
+    tynn = (f' <span style="color:{DC["orange"]};">· kun {r["antallHistoriske"]} '
+            f'tidligere korreksjoner</span>') if r["tynnHistorikk"] else ""
+    gate = gate_pille() if reversal_blokkert(r) else ""
+
+    def score(etikett, verdi, fargelegg=None):
+        return (f'<div style="text-align:right;">'
+                f'<div style="font-family:{MONO};font-size:9px;color:{DC["dempet"]};">{etikett}</div>'
+                f'<div style="font-family:{MONO};font-size:14px;'
+                f'color:{fargelegg or DC["tekst"]};">{verdi:.0f}</div></div>')
+
+    return f"""
+<div style="display:grid;grid-template-columns:96px 1fr 160px 90px 76px 76px 76px;
+     align-items:center;gap:12px;background:{DC['kort']};border:1px solid {DC['linje']};
+     border-left:3px solid {farge};border-radius:10px;padding:14px 16px;">
+  <div style="font-family:{DISPLAY};font-size:18px;font-weight:600;
+       color:{DC['tekst']};">{_esc(r['Ticker'])}</div>
+  <div style="font-size:12px;color:{DC['dempet2']};overflow:hidden;
+       text-overflow:ellipsis;white-space:nowrap;">{_esc(r['Navn'])}{dager}{tynn}</div>
+  <div>{badge(r['status'], kort=True)}{gate}</div>
+  <div style="font-family:{MONO};font-size:15px;color:{DC['orange']};text-align:right;">
+    {f'-{f(cc.drawdownPct, 1)} %' if cc else '—'}</div>
+  {score('CORR', r['correctionScore'])}
+  {score('TREND', r['trendScore'], DC['gronn'] if r['trendScore'] >= 60 else None)}
+  {score('RECOV', r['recoveryScore'], DC['dempet'] if r['recoveryScore'] < 30 else None)}
+</div>"""
+
+
+def kompakt_rad_html(r: dict) -> str:
+    """Sone 3: dempet rad, minst mulig visuell vekt."""
+    cc = r.get("currentCorrection")
+
+    def tall(v, farge=None):
+        return (f'<div style="font-family:{MONO};font-size:13px;text-align:right;'
+                f'color:{farge or "inherit"};">{v}</div>')
+
+    return f"""
+<div style="display:grid;grid-template-columns:96px 1fr 160px 90px 76px 76px 76px;
+     align-items:center;gap:12px;padding:10px 16px;border:1px solid {DC['linjeSvak']};
+     border-radius:10px;color:{DC['svak']};">
+  <div style="font-family:{DISPLAY};font-size:15px;font-weight:600;
+       color:{DC['dempet2']};">{_esc(r['Ticker'])}</div>
+  <div style="font-size:12px;overflow:hidden;text-overflow:ellipsis;
+       white-space:nowrap;">{_esc(r['Navn'])}</div>
+  <div>{badge(r['status'], kort=True)}{gate_pille() if reversal_blokkert(r) else ""}</div>
+  {tall(f'-{f(cc.drawdownPct, 1)} %' if cc else '—')}
+  {tall(f"{r['correctionScore']:.0f}")}
+  {tall(f"{r['trendScore']:.0f}", DC['gronn'] if r['trendScore'] >= 80 else None)}
+  {tall(f"{r['recoveryScore']:.0f}")}
+</div>"""
+
+
+def kriterieliste_html(tittel: str, score: float, deler: dict,
+                       poeng: dict, etiketter: dict) -> str:
+    """Full poengoppdeling, som i mockupens KRITERIER-fane."""
+    rader = []
+    for nokkel, etikett in etiketter.items():
+        truffet = bool(deler.get(nokkel))
+        maks = poeng[nokkel]
+        rader.append(
+            f'<div style="display:grid;grid-template-columns:18px 1fr 54px;gap:10px;'
+            f'align-items:center;padding:5px 0;font-size:12px;'
+            f'color:{DC["dempet2"] if truffet else DC["svak"]};">'
+            f'<span style="color:{DC["gronn"] if truffet else DC["kant"]};">'
+            f'{"✓" if truffet else "·"}</span>'
+            f'<span>{etikett}</span>'
+            f'<span style="font-family:{MONO};font-size:11px;text-align:right;'
+            f'color:{DC["tekst"] if truffet else DC["svak"]};">'
+            f'{maks if truffet else 0}/{maks}</span></div>'
+        )
+    return (f'<div><div style="display:flex;align-items:baseline;gap:10px;'
+            f'margin-bottom:6px;"><span style="font-family:{MONO};font-size:10px;'
+            f'letter-spacing:0.1em;color:{DC["dempet"]};">{tittel}</span>'
+            f'<span style="font-family:{MONO};font-size:18px;color:{DC["tekst"]};">'
+            f'{score:.0f}</span></div>{"".join(rader)}</div>')
+
+
+def korreksjonsforlop_html(r: dict) -> str:
+    cc = r.get("currentCorrection")
+    if not cc:
+        return f'<div style="color:{DC["dempet"]};font-size:12px;">Ingen korreksjon registrert.</div>'
+
+    def punkt(etikett, verdi, dato, farge=None):
+        return (f'<div><div style="font-family:{MONO};font-size:10px;letter-spacing:0.1em;'
+                f'color:{DC["dempet"]};">{etikett}</div>'
+                f'<div style="font-family:{MONO};font-size:19px;color:{farge or DC["tekst"]};">'
+                f'{verdi}</div>'
+                f'<div style="font-family:{MONO};font-size:11px;color:{DC["dempet"]};">'
+                f'{dato}</div></div>')
+
+    pil = (f'<div style="color:{DC["kant"]};font-size:18px;align-self:center;">→</div>')
+    w = r["correctionScoreWeights"] if "correctionScoreWeights" in r else SCANNER_CONFIG["correctionScoreWeights"]
+
+    return (
+        f'<div style="display:flex;gap:22px;align-items:stretch;flex-wrap:wrap;">'
+        f'{punkt("TOPP", f(cc.peakPrice), cc.peakDate)}{pil}'
+        f'{punkt("BUNN", f(cc.troughPrice), cc.troughDate, DC["roed"])}{pil}'
+        f'{punkt("NÅ", f(cc.currentPrice), f"{cc.daysSincePeak} dager siden topp")}'
+        f'</div>'
+        f'<div style="margin-top:14px;font-size:12px;color:{DC["dempet2"]};line-height:1.6;">'
+        f'Correction Score {r["correctionScore"]:.0f} = percentil {r["correctionPercentile"]:.0f} '
+        f'× {w["percentile"]:.0%} + stretch {r["stretchScore"]:.0f} × {w["technicalStretch"]:.0%} '
+        f'+ støtte {r["supportScore"]:.0f} × {w["support"]:.0%}.'
+        + (f' Nærmeste bekreftede swing-low {f(r["supportNivå"])}, '
+           f'{f(r["supportAvstandPct"], 2)} % fra kurs.' if r.get("supportNivå") else
+           " Ingen bekreftet swing-low funnet ennå.")
+        + f'</div>'
+        + (f'<div style="margin-top:8px;font-size:12px;color:{DC["orange"]};">'
+           f'⚠️ Kun {r["antallHistoriske"]} tidligere korreksjoner — percentilen er '
+           f'lite pålitelig.</div>' if r["tynnHistorikk"] else "")
+    )
+
+
+def nokkeltall_html(r: dict) -> str:
+    ind = r["ind"]
+    rader = [
+        ("Kurs", f(ind["close_now"])), ("1D %", f(ind["return1d"], 2, " %")),
+        ("1M %", f(ind["return1m"], 1, " %")), ("3M %", f(ind["return3m"], 1, " %")),
+        ("6M %", f(ind["return6m"], 1, " %")), ("52W drawdown", f(ind["drawdown52w"], 1, " %")),
+        ("RSI 14", f(ind["rsi"], 1)), ("SMA20", f(ind["sma20"])),
+        ("SMA50", f(ind["sma50"])), ("SMA200", f(ind["sma200"])),
+        ("ATR 14", f(ind["atr"])), ("ATR %", f(ind["atrPct"], 2, " %")),
+        ("Volum", f(ind["volume_now"], 0)), ("Vol Ratio", f(ind["volumeRatio20d"])),
+        ("20D high", f(ind["high20d"])), ("60D high", f(ind["high60d"])),
+        ("52W high", f(ind["high52w"])), ("Gap ned %", f(ind["gapDownPct"], 2, " %")),
+    ]
+    celler = "".join(
+        f'<div style="border:1px solid {DC["linje"]};border-radius:8px;padding:9px 11px;">'
+        f'<div style="font-family:{MONO};font-size:9px;letter-spacing:0.1em;'
+        f'color:{DC["dempet"]};">{e.upper()}</div>'
+        f'<div style="font-family:{MONO};font-size:14px;color:{DC["tekst"]};">{v}</div></div>'
+        for e, v in rader
+    )
+    return (f'<div style="display:grid;grid-template-columns:repeat(6,minmax(0,1fr));'
+            f'gap:8px;">{celler}</div>')
+
+
+def historikk_html(r: dict) -> str:
+    h = r["historiskeKorreksjoner"]
+    if not h:
+        return (f'<div style="color:{DC["dempet"]};font-size:12px;">'
+                f'Ingen avsluttede korreksjoner funnet i historikken.</div>')
+    sortert = sorted(h, key=lambda x: -x.drawdownPct)[:25]
+    naa = r["currentCorrection"].maxDepthPct if r.get("currentCorrection") else None
+    rader = []
+    for k in sortert:
+        storre = naa is not None and k.drawdownPct > naa
+        rader.append(
+            f'<tr style="color:{DC["dempet2"] if storre else DC["tekst"]};">'
+            f'<td style="padding:4px 10px 4px 0;font-family:{MONO};font-size:11px;">{k.peakDate}</td>'
+            f'<td style="padding:4px 10px 4px 0;font-family:{MONO};font-size:11px;">{k.troughDate}</td>'
+            f'<td style="padding:4px 10px 4px 0;font-family:{MONO};font-size:12px;text-align:right;">'
+            f'-{k.drawdownPct:.1f} %</td>'
+            f'<td style="padding:4px 10px 4px 0;font-family:{MONO};font-size:11px;text-align:right;">'
+            f'{k.durationDays} d</td>'
+            f'<td style="padding:4px 0;font-family:{MONO};font-size:11px;text-align:right;">'
+            f'{k.atrNormalizedDrawdown:.1f}×</td></tr>'
+        )
+    naa_rad = ""
+    if naa is not None:
+        naa_rad = (f'<tr style="color:{DC["roed"]};border-top:1px solid {DC["kant"]};">'
+                   f'<td colspan="2" style="padding:7px 10px 4px 0;font-family:{MONO};'
+                   f'font-size:11px;">NÅ</td>'
+                   f'<td style="padding:7px 10px 4px 0;font-family:{MONO};font-size:12px;'
+                   f'text-align:right;">-{naa:.1f} %</td><td colspan="2"></td></tr>')
+    return (f'<table style="width:100%;border-collapse:collapse;">'
+            f'<thead><tr style="color:{DC["dempet"]};">'
+            + "".join(f'<th style="text-align:{"right" if i > 1 else "left"};'
+                      f'padding:0 10px 6px 0;font-family:{MONO};font-size:9px;'
+                      f'letter-spacing:0.1em;font-weight:400;">{t}</th>'
+                      for i, t in enumerate(["TOPP", "BUNN", "FALL", "VARIGHET", "I ATR"]))
+            + f'</tr></thead><tbody>{naa_rad}{"".join(rader)}</tbody></table>')
+
+
+def tabell_html(resultater: list) -> str:
+    """TABELL-visningen: tett rad per aksje med statusfarge som venstre-spine."""
+    kolonner = ["TICKER", "NAVN", "STATUS", "CORR", "TREND", "RECOV",
+                "KORR %", "PCTL", "DAGER", "KURS", "% I DAG", "RSI", "VOL R", "F"]
+    hoder = "".join(
+        f'<th style="text-align:{"left" if i < 3 else "right"};padding:0 10px 8px;'
+        f'font-family:{MONO};font-size:9px;letter-spacing:0.11em;font-weight:400;'
+        f'color:{DC["dempet"]};white-space:nowrap;">{k}</th>'
+        for i, k in enumerate(kolonner))
+
+    rader = []
+    tynn_finnes = False
+    for r in resultater:
+        cc, ind = r.get("currentCorrection"), r["ind"]
+        farge = STATUS_FARGE[r["status"]]
+        dempet = r["status"] == STATUS_WAIT
+        tekstfarge = DC["svak"] if dempet else DC["tekst"]
+        pct = f"{r['correctionPercentile']:.0f}"
+        if r["tynnHistorikk"]:
+            pct += "*"
+            tynn_finnes = True
+        d1 = ind.get("return1d")
+
+        def c(v, align="right", farge_=None, mono=True, nowrap=True):
+            return (f'<td style="padding:9px 10px;text-align:{align};'
+                    f'font-family:{MONO if mono else SANS};font-size:12px;'
+                    f'color:{farge_ or tekstfarge};'
+                    f'{"white-space:nowrap;" if nowrap else ""}'
+                    f'border-bottom:1px solid {DC["linjeSvak"]};">{v}</td>')
+
+        rader.append(
+            f'<tr>'
+            f'<td style="padding:0;width:3px;background:{farge};'
+            f'border-bottom:1px solid {DC["linjeSvak"]};"></td>'
+            + c(f'<span style="font-family:{DISPLAY};font-size:14px;font-weight:600;">'
+                f'{_esc(r["Ticker"])}</span>', "left")
+            + c(f'<span style="overflow:hidden;text-overflow:ellipsis;">{_esc(r["Navn"])}</span>',
+                "left", DC["dempet2"], mono=False)
+            + c(badge(r["status"], kort=True)
+                + (gate_pille() if reversal_blokkert(r) else ""), "left")
+            + c(f"{r['correctionScore']:.0f}")
+            + c(f"{r['trendScore']:.0f}", farge_=DC["gronn"] if r["trendScore"] >= 60 and not dempet else None)
+            + c(f"{r['recoveryScore']:.0f}")
+            + c(f"-{f(cc.drawdownPct, 1)}" if cc else "—", farge_=DC["orange"] if cc and not dempet else None)
+            + c(pct)
+            + c(cc.daysSincePeak if cc else "—")
+            + c(f(ind["close_now"]))
+            + c(f(d1, 2), farge_=(DC["gronn"] if d1 >= 0 else DC["roed"]) if d1 is not None and not dempet else None)
+            + c(f(ind["rsi"], 1))
+            + c(f(ind["volumeRatio20d"]))
+            + c("✓" if r["fundamentalsChecked"] else "—",
+                farge_=DC["gronn"] if r["fundamentalsChecked"] else None)
+            + f'</tr>'
+        )
+
+    fotnote = ("* TYNN HISTORIKK — PERCENTILEN ER LITE PÅLITELIG · " if tynn_finnes else "")
+    return (f'<div style="background:{DC["kort"]};border:1px solid {DC["linje"]};'
+            f'border-radius:10px;overflow:hidden;">'
+            f'<div style="overflow-x:auto;">'
+            f'<table style="width:100%;border-collapse:collapse;">'
+            f'<thead><tr><th style="width:3px;padding:0;"></th>{hoder}</tr></thead>'
+            f'<tbody>{"".join(rader)}</tbody></table></div>'
+            f'<div style="padding:10px 14px;font-family:{MONO};font-size:9px;'
+            f'letter-spacing:0.1em;color:{DC["dempet"]};border-top:1px solid {DC["linje"]};">'
+            f'{fotnote}RADAREN GIR INGEN KJØPS- ELLER SALGSSIGNALER</div></div>')
+
+
+def varsel_html(v: dict) -> str:
+    status = v["type"].rstrip("+")
+    farge = STATUS_FARGE.get(status, DC["blaa"])
+    return (f'<div style="background:{DC["kort"]};border-left:3px solid {farge};'
+            f'border-radius:0 8px 8px 0;padding:11px 12px;margin-bottom:8px;">'
+            f'<div style="font-family:{MONO};font-size:12px;font-weight:600;'
+            f'color:{DC["tekst"]};">{_esc(v["ticker"])} → {STATUS_TEKST.get(status, status)}</div>'
+            f'<div style="font-size:11px;color:{DC["dempet"]};margin-top:3px;'
+            f'line-height:1.5;">{_esc(v.get("sammendrag", v["tid"]))}</div></div>')
+
+
+def sorter_resultater(resultater: list, valg: str) -> list:
+    """Standard: det som krever oppmerksomhet først (§18)."""
+    if valg == "TICKER":
+        return sorted(resultater, key=lambda r: r["Ticker"])
+    if valg == "KORREKSJON %":
+        return sorted(resultater, key=lambda r: -(r["currentCorrection"].drawdownPct
+                                                  if r.get("currentCorrection") else -999))
+    felt = SORTERINGSVALG.get(valg)
+    if felt:
+        return sorted(resultater, key=lambda r: -r[felt])
+    return sorted(resultater, key=lambda r: (
+        STATUS_PRIORITY.get(r["status"], 99), -r["correctionScore"]
+    ))
+
+
+# ══════════════════════════════════════════════════════════════
+# STREAMLIT APP
+# ══════════════════════════════════════════════════════════════
+
+def _fundamental_gate(r: dict, fund_store: dict) -> bool:
+    """Fire avkrysninger. Returnerer True hvis noe ble endret."""
     fund: FundamentalCheck = r["fundamental"]
     t = r["ticker"]
 
-    if fund.stale:
-        st.caption("⚠️ Forrige fundamentale sjekk gjaldt en tidligere korreksjon og er nullstilt.")
+    with st.container(key=f"gate-{t.replace('.', '-')}"):
+        c = st.columns(4)
+        ny = FundamentalCheck(
+            reportChecked=c[0].checkbox("Siste rapport", value=fund.reportChecked, key=f"fr_{t}"),
+            guidanceChecked=c[1].checkbox("Guiding", value=fund.guidanceChecked, key=f"fg_{t}"),
+            newsChecked=c[2].checkbox("Nyheter", value=fund.newsChecked, key=f"fn_{t}"),
+            thesisIntact=c[3].checkbox("Case intakt", value=fund.thesisIntact, key=f"ft_{t}"),
+            correctionId=r["correctionId"],
+        )
 
-    c = st.columns(4)
-    ny = FundamentalCheck(
-        reportChecked=c[0].checkbox("Siste rapport sjekket", value=fund.reportChecked, key=f"fr_{t}"),
-        guidanceChecked=c[1].checkbox("Guiding sjekket", value=fund.guidanceChecked, key=f"fg_{t}"),
-        newsChecked=c[2].checkbox("Relevante nyheter sjekket", value=fund.newsChecked, key=f"fn_{t}"),
-        thesisIntact=c[3].checkbox("Case intakt", value=fund.thesisIntact, key=f"ft_{t}"),
-        correctionId=r["correctionId"],
-    )
-
-    endret = (
-        ny.reportChecked != fund.reportChecked
-        or ny.guidanceChecked != fund.guidanceChecked
-        or ny.newsChecked != fund.newsChecked
-        or ny.thesisIntact != fund.thesisIntact
-        or fund.stale
-    )
+    endret = (ny.reportChecked != fund.reportChecked
+              or ny.guidanceChecked != fund.guidanceChecked
+              or ny.newsChecked != fund.newsChecked
+              or ny.thesisIntact != fund.thesisIntact
+              or fund.stale)
     if endret:
         ny.updated = datetime.now(ZoneInfo("Europe/Oslo")).strftime("%Y-%m-%d %H:%M")
         d = asdict(ny)
@@ -1700,336 +2284,175 @@ def _render_fundamental(r: dict, fund_store: dict) -> bool:
     return endret
 
 
-def render_kort(r: dict, fund_store: dict) -> bool:
-    """Ett aksjekort. Ny hovedinformasjon øverst, eksisterende info under."""
-    ind = r["ind"]
-    cc: Optional[ActiveCorrection] = r.get("currentCorrection")
+def _detaljer(r: dict, fund_store: dict = None) -> bool:
+    """
+    DETALJER-panelet: fire faner, som i mockupen.
 
-    with st.container(border=True):
-        top = st.columns([3, 2])
-        top[0].markdown(
-            f"### [{r['Ticker']}](https://finance.yahoo.com/quote/{r['ticker']}) "
-            f"<span style='font-size:0.6em;color:#888'>{r['Navn']}</span>",
-            unsafe_allow_html=True,
-        )
-        top[1].markdown(f"### {STATUS_LABEL.get(r['status'], r['status'])}")
-
-        s = st.columns(3)
-        s[0].metric("Correction Score", f"{r['correctionScore']:.0f}")
-        s[1].metric("Trend Score", f"{r['trendScore']:.0f}", r["trendBand"], delta_color="off")
-        s[2].metric("Recovery Score", f"{r['recoveryScore']:.0f}", r["recoveryBand"], delta_color="off")
-
-        k = st.columns(4)
-        k[0].metric("Korreksjon nå", f"-{f(cc.drawdownPct, 1)} %" if cc else "—",
-                    f"dybde -{f(cc.maxDepthPct, 1)} %" if cc else None, delta_color="off")
-        k[1].metric("Percentil", f"{r['correctionPercentile']:.0f}",
-                    "tynn historikk" if r["tynnHistorikk"] else f"{r['antallHistoriske']} tidligere",
-                    delta_color="off")
-        k[2].metric("Dager siden topp", cc.daysSincePeak if cc else "—")
-        k[3].metric("Event Risk", "JA" if r["eventRisk"] else "NEI")
-
-        if r["tynnHistorikk"]:
-            st.caption(
-                f"⚠️ Kun {r['antallHistoriske']} tidligere korreksjoner i historikken – "
-                "percentilen er lite pålitelig."
-            )
-        if not r["fundamentalsChecked"]:
-            st.caption("🔎 Fundamental sjekk ikke fullført. REVERSAL er blokkert.")
-
-        # ── Fundamental gate ──
-        endret = _render_fundamental(r, fund_store)
-
-        # ── Eksisterende informasjon beholdes som støtteinfo ──
-        with st.expander("Detaljer"):
-            a = st.columns(6)
-            a[0].metric("Kurs", f(ind["close_now"]))
-            a[1].metric("1D %", f(ind["return1d"], 2, " %"))
-            a[2].metric("1M %", f(ind["return1m"], 1, " %"))
-            a[3].metric("3M %", f(ind["return3m"], 1, " %"))
-            a[4].metric("6M %", f(ind["return6m"], 1, " %"))
-            a[5].metric("52W drawdown", f(ind["drawdown52w"], 1, " %"))
-
-            b = st.columns(6)
-            b[0].metric("RSI 14", f(ind["rsi"], 1))
-            b[1].metric("SMA20", f(ind["sma20"]))
-            b[2].metric("SMA50", f(ind["sma50"]))
-            b[3].metric("SMA200", f(ind["sma200"]))
-            b[4].metric("Volum", f(ind["volume_now"], 0))
-            b[5].metric("Vol Ratio", f(ind["volumeRatio20d"]))
-
-            c2 = st.columns(6)
-            c2[0].metric("ATR 14", f(ind["atr"]))
-            c2[1].metric("ATR %", f(ind["atrPct"], 2, " %"),
-                         f"i går {f(ind['atrPctPrev'], 2)} %", delta_color="off")
-            c2[2].metric("20D high", f(ind["high20d"]))
-            c2[3].metric("60D high", f(ind["high60d"]))
-            c2[4].metric("52W high", f(ind["high52w"]))
-            c2[5].metric("Gap ned %", f(ind["gapDownPct"], 2, " %"))
-
-            st.markdown("---")
-            if cc:
-                st.markdown(
-                    f"**Korreksjon** `{cc.id}`  \n"
-                    f"Topp {f(cc.peakPrice)} ({cc.peakDate})"
-                    f"{'' if cc.peakConfirmed else ' – ubekreftet, løpende topp'} → "
-                    f"bunn {f(cc.troughPrice)} ({cc.troughDate}) → nå {f(cc.currentPrice)}  \n"
-                    f"Fall fra topp **{f(cc.drawdownPct, 1)} %** · "
-                    f"dybde topp→bunn **{f(cc.maxDepthPct, 1)} %** · "
-                    f"opp fra bunn **{f(cc.recoveryPct, 1)} %** · "
-                    f"{cc.daysSincePeak} dager siden topp"
-                )
-
-            d = st.columns(3)
-            d[0].markdown(
-                f"**Correction Score {r['correctionScore']:.0f}**  \n"
-                f"Percentil {r['correctionPercentile']:.0f} × 60 %  \n"
-                f"Stretch {r['stretchScore']:.0f} × 20 %  \n"
-                f"Støtte {r['supportScore']:.0f} × 20 %"
-            )
-            d[1].markdown(
-                f"**Stretch-detaljer**  \n"
-                f"RSI-del {r['stretchDeler']['rsi']:.0f}  \n"
-                f"SMA20 {r['stretchDeler']['sma20']:.0f} (ATR-z {f(r['stretchDeler']['atrZ20'])})  \n"
-                f"SMA50 {r['stretchDeler']['sma50']:.0f} (ATR-z {f(r['stretchDeler']['atrZ50'])})"
-            )
-            d[2].markdown(
-                f"**Støtte**  \n"
-                f"Nærmeste bekreftede swing-low: {f(r['supportNivå'])}  \n"
-                f"Avstand: {f(r['supportAvstandPct'], 2, ' %')}"
-            )
-
-            st.markdown("---")
-            e = st.columns(2)
-            with e[0]:
-                _sjekkliste("Trend Score", r["trendDeler"],
-                            SCANNER_CONFIG["trendPoints"], TREND_ETIKETTER)
-            with e[1]:
-                _sjekkliste("Recovery Score", r["recoveryDeler"],
-                            SCANNER_CONFIG["recoveryPoints"], RECOVERY_ETIKETTER)
-
+    Sone 2-kort får fundamental-gaten her inne. Uten det ville en aksje i
+    CORRECTION/STABILIZING aldri kunne få sjekken fullført, og dermed aldri
+    kunne nå REVERSAL — trakten ville vært låst.
+    """
+    endret = False
+    with st.expander("DETALJER"):
+        if fund_store is not None:
+            st.markdown(
+                f'<div style="font-family:{MONO};font-size:10px;letter-spacing:0.1em;'
+                f'color:{DC["dempet"]};margin-bottom:2px;">FUNDAMENTAL GATE</div>',
+                unsafe_allow_html=True)
+            endret = _fundamental_gate(r, fund_store)
+        t1, t2, t3, t4 = st.tabs(["KRITERIER", "KORREKSJONSFORLØP",
+                                  f"HISTORIKK ({r['antallHistoriske']})", "NØKKELTALL"])
+        with t1:
+            c = st.columns(2)
+            c[0].markdown(kriterieliste_html("TREND SCORE", r["trendScore"], r["trendDeler"],
+                                             SCANNER_CONFIG["trendPoints"], TREND_ETIKETTER),
+                          unsafe_allow_html=True)
+            c[1].markdown(kriterieliste_html("RECOVERY SCORE", r["recoveryScore"],
+                                             r["recoveryDeler"],
+                                             SCANNER_CONFIG["recoveryPoints"], RECOVERY_ETIKETTER),
+                          unsafe_allow_html=True)
             if r["eventRisk"]:
                 traff = [v for k, v in EVENT_ETIKETTER.items() if r["eventGrunner"].get(k)]
-                st.error("**Event Risk utløst av:** " + ", ".join(traff))
-
-            if r["historiskeKorreksjoner"]:
-                st.markdown("**Historiske korreksjoner (aksjens egen referanse)**")
-                hdf = pd.DataFrame([asdict(h) for h in r["historiskeKorreksjoner"]])
-                hdf = hdf.rename(columns={
-                    "peakDate": "Topp", "troughDate": "Bunn",
-                    "drawdownPct": "Fall %", "durationDays": "Dager",
-                    "atrNormalizedDrawdown": "Fall i ATR",
-                }).drop(columns=["ticker"])
-                st.dataframe(hdf.sort_values("Fall %", ascending=False),
-                             width="stretch", hide_index=True, height=240)
-            else:
-                st.info("Ingen avsluttede korreksjoner funnet i historikken.")
-
+                st.markdown(
+                    f'<div style="margin-top:14px;background:{_rgba(DC["roed"], 0.08)};'
+                    f'border:1px solid {_rgba(DC["roed"], 0.3)};border-radius:8px;padding:11px 13px;'
+                    f'font-size:12px;color:{DC["dempet2"]};"><b style="color:{DC["roed"]};">'
+                    f'Event risk utløst av:</b> {", ".join(traff)}. Målt mot ATR '
+                    f'{f(r["ind"]["atrPctPrev"], 2)} % fra dagen før hendelsen.</div>',
+                    unsafe_allow_html=True)
+        with t2:
+            st.markdown(korreksjonsforlop_html(r), unsafe_allow_html=True)
+        with t3:
+            st.markdown(historikk_html(r), unsafe_allow_html=True)
+        with t4:
+            st.markdown(nokkeltall_html(r), unsafe_allow_html=True)
     return endret
 
 
-def oversiktstabell(resultater: list) -> pd.DataFrame:
-    """Kompakt tabell over hele watchlisten."""
-    rader = []
-    for r in resultater:
-        cc = r.get("currentCorrection")
-        ind = r["ind"]
-        rader.append({
-            "Ticker": r["Ticker"],
-            "Navn": r["Navn"],
-            "Status": STATUS_LABEL.get(r["status"], r["status"]),
-            "Corr": r["correctionScore"],
-            "Trend": r["trendScore"],
-            "Recovery": r["recoveryScore"],
-            "Korreksjon %": -cc.drawdownPct if cc else None,
-            "Percentil": r["correctionPercentile"],
-            "Dager": cc.daysSincePeak if cc else None,
-            "Kurs": ind["close_now"],
-            "% i dag": ind["return1d"],
-            "RSI 14": round(ind["rsi"], 1) if ind["rsi"] else None,
-            "Vol Ratio": ind["volumeRatio20d"],
-            "Event": "JA" if r["eventRisk"] else "",
-            "Fund.": "✅" if r["fundamentalsChecked"] else "",
-        })
-    return pd.DataFrame(rader)
+def _toppbar(antall_aktive: int, antall_total: int) -> tuple:
+    """Tittel, metalinje og kontrollene. Returnerer (visning, sortering, scan)."""
+    oslo = datetime.now(ZoneInfo("Europe/Oslo")).strftime("%H:%M")
+    c = st.columns([3.2, 1.15, 1.05, 0.95, 0.85])
+    with c[0]:
+        st.markdown(
+            f'<div style="padding-top:2px;">'
+            f'<div style="font-family:{DISPLAY};font-size:23px;font-weight:600;'
+            f'color:{DC["tekst"]};letter-spacing:-0.01em;">Correction Radar</div>'
+            f'<div style="font-family:{MONO};font-size:11px;color:{DC["dempet"]};'
+            f'margin-top:2px;">{antall_aktive} av {antall_total} aktive · oppdatert {oslo} '
+            f'· ingen kjøps- eller salgssignaler</div></div>',
+            unsafe_allow_html=True)
+    sortering = c[1].selectbox("SORTER", list(SORTERINGSVALG.keys()), label_visibility="collapsed")
+    refresh = c[2].selectbox("AUTO", ["AUTO AV", "AUTO 5 MIN", "AUTO 10 MIN",
+                                      "AUTO 15 MIN", "AUTO 30 MIN"],
+                             index=3, label_visibility="collapsed")
+    visning = c[3].segmented_control("VISNING", ["KORT", "TABELL"], default="KORT",
+                                     label_visibility="collapsed")
+    scan = c[4].button("SCAN NÅ", type="primary", width="stretch")
 
-
-# ══════════════════════════════════════════════════════════════
-# STREAMLIT APP
-# ══════════════════════════════════════════════════════════════
-
-def _sidebar_watchlist() -> None:
-    """Legg til / fjern / deaktiver selskaper uten kodeendring."""
-    st.sidebar.subheader("📋 Watchlist")
-    universe = st.session_state.universe
-    endret = False
-
-    for i, e in enumerate(universe):
-        c = st.sidebar.columns([3, 1])
-        på = c[0].checkbox(
-            f"{e['ticker'].replace('.OL', '')} — {e['name']}",
-            value=e["enabled"], key=f"uni_{e['ticker']}",
-            help="Fjern haken for å deaktivere uten å slette",
-        )
-        if på != e["enabled"]:
-            universe[i]["enabled"] = på
-            endret = True
-        if c[1].button("🗑", key=f"del_{e['ticker']}", help="Fjern helt"):
-            universe.pop(i)
-            lagre_universe(universe)
+    minutter = {"AUTO AV": 0, "AUTO 5 MIN": 5, "AUTO 10 MIN": 10,
+                "AUTO 15 MIN": 15, "AUTO 30 MIN": 30}[refresh]
+    if minutter > 0:
+        tick = st_autorefresh(interval=minutter * 60 * 1000, key="auto_refresh")
+        if tick and tick > 0:
             st.cache_data.clear()
-            st.rerun()
 
-    st.sidebar.markdown("---")
-    ledige = {v: k for k, v in OSLO_TICKERS.items()
-              if k not in {e["ticker"] for e in universe}}
-    valg = st.sidebar.selectbox("Legg til fra Oslo Børs", ["—"] + sorted(ledige.keys()))
-    if valg != "—" and st.sidebar.button("➕ Legg til", width="stretch"):
-        universe.append(_universe_rad(ledige[valg]))
-        lagre_universe(universe)
-        st.cache_data.clear()
-        st.rerun()
-
-    fri = st.sidebar.text_input("Eller ticker manuelt", placeholder="f.eks. AAPL eller EQNR.OL",
-                                help="Kjente Oslo-tickere får .OL automatisk. Ukjente står urørt, "
-                                     "så amerikanske aksjer kan legges til direkte.")
-    if fri and st.sidebar.button("➕ Legg til ticker", width="stretch"):
-        t = _normaliser_ticker(fri)
-        if t not in {e["ticker"] for e in universe}:
-            universe.append(_universe_rad(t))
-            lagre_universe(universe)
-            st.cache_data.clear()
-            st.rerun()
-
-    if endret:
-        lagre_universe(universe)
-        st.rerun()
-
-    st.sidebar.caption(
-        "⚠️ Watchlist, fundamental-avkryssing og varselhistorikk lagres på disk. "
-        "På Streamlit Cloud er disken flyktig og nullstilles når appen starter på nytt — "
-        f"da faller watchlisten tilbake til DEFAULT_WATCHLIST i scanner.py "
-        f"({', '.join(t.replace('.OL', '') for t in DEFAULT_WATCHLIST)})."
-    )
+    st.markdown(f'<div style="height:1px;background:{DC["linje"]};margin:14px 0 4px;"></div>',
+                unsafe_allow_html=True)
+    return visning or "KORT", sortering, scan
 
 
-def _vis_varsler(state: dict) -> None:
+def _rail(resultater: list, state: dict) -> None:
+    """Høyre kolonne: varsler og watchlist."""
     nye = st.session_state.get("nye_varsler", [])
+    st.markdown(
+        f'<div style="font-family:{MONO};font-size:10px;letter-spacing:0.14em;'
+        f'color:{DC["dempet"]};margin-bottom:8px;">NYE VARSLER · {len(nye)}</div>',
+        unsafe_allow_html=True)
+
     if nye:
-        st.subheader(f"🔔 Nye varsler ({len(nye)})")
-        for v in nye:
-            boks = st.error if v["type"] == "EVENT_RISK" else st.warning
-            boks(v["tekst"])
+        st.markdown("".join(varsel_html(v) for v in nye), unsafe_allow_html=True)
+    else:
+        st.markdown(f'<div style="font-size:12px;color:{DC["svak"]};margin-bottom:10px;">'
+                    f'Ingen statusendringer siden forrige skanning.</div>',
+                    unsafe_allow_html=True)
 
     logg = state.get("alerts", [])
     if logg:
-        with st.expander(f"Varselhistorikk ({len(logg)})"):
+        with st.expander(f"VARSELHISTORIKK ({len(logg)})"):
             st.dataframe(
-                pd.DataFrame([{"Tid": v["tid"], "Ticker": v["ticker"], "Type": v["type"]}
+                pd.DataFrame([{"Tid": v["tid"], "Ticker": v["ticker"],
+                               "Type": STATUS_TEKST.get(v["type"].rstrip("+"), v["type"])}
                               for v in logg]),
-                width="stretch", hide_index=True, height=260,
-            )
+                width="stretch", hide_index=True, height=240)
 
+    st.markdown(f'<div style="height:1px;background:{DC["linje"]};margin:18px 0 12px;"></div>',
+                unsafe_allow_html=True)
 
-def main() -> None:
-    """Streamlit hovedapp."""
-    st.set_page_config(page_title="Correction Radar", page_icon="📡", layout="wide")
-    st.title("📡 Correction Radar")
-    st.caption(
-        "Overvåker en forhåndsgodkjent watchlist og finner fall som er uvanlig store "
-        "*for akkurat den aksjen*. Radaren gir ingen kjøps- eller salgsanbefalinger — "
-        "den peker på hva som bør undersøkes manuelt."
-    )
+    universe = st.session_state.universe
+    aktive = sum(1 for e in universe if e["enabled"])
+    st.markdown(
+        f'<div style="font-family:{MONO};font-size:10px;letter-spacing:0.14em;'
+        f'color:{DC["dempet"]};margin-bottom:4px;">WATCHLIST · {aktive}/{len(universe)}</div>',
+        unsafe_allow_html=True)
 
-    # ── State ──
-    if "universe" not in st.session_state:
-        st.session_state.universe = last_universe()
-        if not UNIVERSE_FILE.exists():
-            lagre_universe(st.session_state.universe)
-    if "fundamentals" not in st.session_state:
-        st.session_state.fundamentals = last_fundamentals()
-    if "radar_state" not in st.session_state:
-        st.session_state.radar_state = last_state()
+    score = {r["ticker"]: r["correctionScore"] for r in resultater}
+    farge = {r["ticker"]: STATUS_FARGE[r["status"]] for r in resultater}
 
-    _sidebar_watchlist()
-
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("⚙️ Visning")
-    sortering = st.sidebar.selectbox("Sorter etter", list(SORTERINGSVALG.keys()))
-    vis_wait = st.sidebar.checkbox("Vis WAIT-aksjer som kort", value=False,
-                                   help="WAIT er alltid med i oversiktstabellen")
-
-    refresh_opts = {"Av": 0, "5 min": 5, "10 min": 10, "15 min": 15, "30 min": 30}
-    rv = st.sidebar.selectbox("Auto-refresh", list(refresh_opts.keys()), index=3)
-    rm = refresh_opts[rv]
-    if rm > 0:
-        t = st_autorefresh(interval=rm * 60 * 1000, key="auto_refresh")
-        if t and t > 0:
-            st.cache_data.clear()
-
-    aktive = [e["ticker"] for e in st.session_state.universe if e["enabled"]]
-    c1, c2 = st.columns([1, 4])
-    if c1.button("🔄 Scan nå", type="primary", width="stretch"):
-        st.cache_data.clear()
-    c2.caption(f"{len(aktive)} aktive av {len(st.session_state.universe)} i watchlisten · "
-               f"{SCANNER_CONFIG['historyYears']} års daglig historikk")
-
-    if not aktive:
-        st.warning("Ingen aktive selskaper i watchlisten. Legg til i sidepanelet.")
-        return
-
-    # ── Hent data og kjør motoren ──
-    prisdata = hent_prisdata(tuple(sorted(aktive)))
-    if not prisdata:
-        st.error("Fikk ikke data fra Yahoo. Prøv «Scan nå» igjen om litt.")
-        return
-
-    manglende = [t for t in aktive if t not in prisdata]
-    if manglende:
-        st.warning("Mangler data for: " + ", ".join(t.replace(".OL", "") for t in manglende))
-
-    resultater = kjor_scan(prisdata, st.session_state.fundamentals)
-    if not resultater:
-        st.error("Ingen aksjer hadde nok historikk "
-                 f"(krever minst {SCANNER_CONFIG['minimumHistoryYears']} år).")
-        return
-
-    # ── Varsler ──
-    st.session_state.nye_varsler = evaluer_varsler(resultater, st.session_state.radar_state)
-    lagre_state(st.session_state.radar_state)
-
-    st.markdown("---")
-    _vis_varsler(st.session_state.radar_state)
-
-    # ── Statusoversikt ──
-    st.markdown("---")
-    telling = {s: 0 for s in STATUS_PRIORITY}
-    for r in resultater:
-        telling[r["status"]] += 1
-    mc = st.columns(len(STATUS_PRIORITY))
-    for i, s in enumerate(STATUS_PRIORITY):
-        mc[i].metric(STATUS_LABEL[s], telling[s])
-
-    # ── Kort ──
-    st.markdown("---")
-    sortert = sorter_resultater(resultater, sortering)
-    synlige = sortert if vis_wait else [r for r in sortert if r["status"] != STATUS_WAIT]
-
-    if not synlige:
-        st.info("Ingen aksjer over FOLLOW-terskelen nå. Alt ligger på WAIT.")
-    for r in synlige:
-        if render_kort(r, st.session_state.fundamentals):
+    with st.container(key="rail-watchlist"):
+        endret = False
+        for i, e in enumerate(universe):
+            t = e["ticker"]
+            c = st.columns([0.14, 1.5, 0.42, 0.3])
+            c[0].markdown(
+                f'<div style="width:7px;height:7px;border-radius:50%;margin-top:9px;'
+                f'background:{farge.get(t, DC["kant"])};"></div>', unsafe_allow_html=True)
+            paa = c[1].checkbox(t.replace(".OL", ""), value=e["enabled"], key=f"uni_{t}")
+            c[2].markdown(
+                f'<div style="font-family:{MONO};font-size:11px;color:{DC["svak"]};'
+                f'text-align:right;padding-top:6px;">'
+                f'{score[t]:.0f}</div>' if t in score else "", unsafe_allow_html=True)
+            if c[3].button("✕", key=f"del_{t}", help="Fjern fra watchlist"):
+                universe.pop(i)
+                lagre_universe(universe)
+                st.cache_data.clear()
+                st.rerun()
+            if paa != e["enabled"]:
+                universe[i]["enabled"] = paa
+                endret = True
+        if endret:
+            lagre_universe(universe)
             st.rerun()
 
-    # ── Oversiktstabell ──
-    st.markdown("---")
-    st.subheader("Oversikt")
-    st.dataframe(oversiktstabell(sortert), width="stretch", hide_index=True,
-                 height=min(len(sortert) * 38 + 40, 600))
+    ledige = {v: k for k, v in OSLO_TICKERS.items()
+              if k not in {e["ticker"] for e in universe}}
+    with st.expander("+ LEGG TIL"):
+        valg = st.selectbox("Fra Oslo Børs", ["—"] + sorted(ledige.keys()),
+                            label_visibility="collapsed")
+        if valg != "—" and st.button("LEGG TIL", key="add_oslo", width="stretch"):
+            universe.append(_universe_rad(ledige[valg]))
+            lagre_universe(universe)
+            st.cache_data.clear()
+            st.rerun()
+        fri = st.text_input("Ticker manuelt", placeholder="AAPL / EQNR.OL",
+                            label_visibility="collapsed")
+        if fri and st.button("LEGG TIL TICKER", key="add_fri", width="stretch"):
+            t = _normaliser_ticker(fri)
+            if t not in {e["ticker"] for e in universe}:
+                universe.append(_universe_rad(t))
+                lagre_universe(universe)
+                st.cache_data.clear()
+                st.rerun()
 
-    # ── Regler ──
-    st.markdown("---")
-    with st.expander("ℹ️ Slik virker radaren"):
-        c = SCANNER_CONFIG
+    st.markdown(
+        f'<div style="font-size:10px;color:{DC["svak"]};line-height:1.6;margin-top:10px;">'
+        f'Lagres på disk. På Streamlit Cloud nullstilles listen ved omstart og faller '
+        f'tilbake til DEFAULT_WATCHLIST.</div>', unsafe_allow_html=True)
+
+
+def _fotnote() -> None:
+    c = SCANNER_CONFIG
+    with st.expander("SLIK VIRKER RADAREN"):
         st.markdown(f"""
 **Kjerneprinsippet:** ingen felles prosentgrense. Hver aksje sammenlignes med sin egen
 historikk av korreksjoner, funnet med ATR-normalisert ZigZag
@@ -2044,17 +2467,18 @@ og samtidig helt normal NAS-støy.
 | Trend | Er kursstrukturen fortsatt frisk? | SMA-struktur, helning, higher lows |
 | Recovery | Er fallet i ferd med å ta slutt? | Higher low, RSI, SMA20, motstandsbrudd, volum |
 
-**Statuser (rekkefølgen er bindende):**
+**Sonene** følger statusprioriteringen: EVENT RISK og REVERSAL krever gjennomgang,
+STABILIZING/STRONG CORRECTION/CORRECTION følges, FOLLOW og WAIT ligger rolig.
 
 | Status | Krav |
 |---|---|
-| 🔴 EVENT RISK | Unormalt raskt fall og fundamental sjekk ikke fullført — overstyrer alt |
-| ⚫ WAIT | Correction Score < {c['correction']['follow']} |
-| ⚪ FOLLOW | Correction Score {c['correction']['follow']}–{c['correction']['correction'] - 1} |
-| 🟡 CORRECTION | Corr ≥ {c['correction']['correction']}, Recovery < {c['recovery']['stabilizing']} |
-| 🟠 STRONG CORRECTION | Corr ≥ {c['correction']['strong']}, Recovery < {c['recovery']['stabilizing']} |
-| 🔵 STABILIZING | Corr ≥ {c['correction']['correction']}, Recovery {c['recovery']['stabilizing']}–{c['recovery']['confirmed'] - 1} |
-| 🟢 REVERSAL | Corr ≥ {c['correction']['correction']}, Recovery ≥ {c['recovery']['confirmed']}, Trend ≥ {c['trend']['minimumForReversal']}, fundamental sjekk fullført **og** case intakt |
+| EVENT RISK | Unormalt raskt fall og fundamental sjekk ikke fullført — overstyrer alt |
+| WAIT | Correction Score < {c['correction']['follow']} |
+| FOLLOW | Correction Score {c['correction']['follow']}–{c['correction']['correction'] - 1} |
+| CORRECTION | Corr ≥ {c['correction']['correction']}, Recovery < {c['recovery']['stabilizing']} |
+| STRONG CORRECTION | Corr ≥ {c['correction']['strong']}, Recovery < {c['recovery']['stabilizing']} |
+| STABILIZING | Corr ≥ {c['correction']['correction']}, Recovery {c['recovery']['stabilizing']}–{c['recovery']['confirmed'] - 1} |
+| REVERSAL | Corr ≥ {c['correction']['correction']}, Recovery ≥ {c['recovery']['confirmed']}, Trend ≥ {c['trend']['minimumForReversal']}, fundamental sjekk fullført **og** case intakt |
 
 **Kurs under SMA200 fjerner ikke aksjen** — det trekker bare Trend Score.
 
@@ -2065,16 +2489,100 @@ nok til at traden bør vurderes manuelt.
 utdypes. Varsel går ved statusendring, eller når fallet øker
 {c['alerts']['severityStepPct']} prosentpoeng innenfor samme korreksjon.
         """)
-
-    with st.expander("⚙️ Aktiv config"):
+    with st.expander("AKTIV CONFIG"):
         st.caption("Alle terskler ligger i SCANNER_CONFIG øverst i scanner.py.")
         st.json(SCANNER_CONFIG)
 
-    oslo_tid = datetime.now(ZoneInfo("Europe/Oslo")).strftime("%Y-%m-%d %H:%M")
-    st.caption(
-        f"Oppdatert: {oslo_tid} (Oslo) · {len(resultater)} selskaper skannet · "
-        "Correction Radar v6 — ingen kjøps- eller salgssignaler"
-    )
+
+def main() -> None:
+    """Streamlit hovedapp – retning 1b TRIAGE."""
+    st.set_page_config(page_title="Correction Radar", page_icon="📡",
+                       layout="wide", initial_sidebar_state="collapsed")
+    injiser_css()
+
+    if "universe" not in st.session_state:
+        st.session_state.universe = last_universe()
+        if not UNIVERSE_FILE.exists():
+            lagre_universe(st.session_state.universe)
+    if "fundamentals" not in st.session_state:
+        st.session_state.fundamentals = last_fundamentals()
+    if "radar_state" not in st.session_state:
+        st.session_state.radar_state = last_state()
+
+    universe = st.session_state.universe
+    aktive = [e["ticker"] for e in universe if e["enabled"]]
+
+    visning, sortering, scan = _toppbar(len(aktive), len(universe))
+    if scan:
+        st.cache_data.clear()
+
+    if not aktive:
+        st.warning("Ingen aktive selskaper i watchlisten. Legg til i høyre kolonne.")
+        return
+
+    prisdata = hent_prisdata(tuple(sorted(aktive)))
+    if not prisdata:
+        st.error("Fikk ikke data fra Yahoo. Prøv «SCAN NÅ» igjen om litt.")
+        return
+
+    resultater = kjor_scan(prisdata, st.session_state.fundamentals)
+    if not resultater:
+        st.error("Ingen aksjer hadde nok historikk "
+                 f"(krever minst {SCANNER_CONFIG['minimumHistoryYears']} år).")
+        return
+
+    st.session_state.nye_varsler = evaluer_varsler(resultater, st.session_state.radar_state)
+    lagre_state(st.session_state.radar_state)
+
+    sortert = sorter_resultater(resultater, sortering)
+    hoved, rail = st.columns([3.35, 1], gap="large")
+
+    with hoved:
+        manglende = [t for t in aktive if t not in prisdata]
+        if manglende:
+            st.warning("Mangler data for: "
+                       + ", ".join(t.replace(".OL", "") for t in manglende))
+
+        if visning == "TABELL":
+            st.markdown(tabell_html(sortert), unsafe_allow_html=True)
+        else:
+            for sone in SONER:
+                i_sone = [r for r in sortert if r["status"] in sone["statuser"]]
+                st.markdown(sone_header(sone["navn"], sone["farge"], len(i_sone)),
+                            unsafe_allow_html=True)
+                if not i_sone:
+                    st.markdown(
+                        f'<div style="font-size:12px;color:{DC["svak"]};'
+                        f'padding:2px 0 6px;">Ingen aksjer i denne sonen nå.</div>',
+                        unsafe_allow_html=True)
+                    continue
+
+                for r in i_sone:
+                    if sone["form"] == "stor":
+                        st.markdown(stort_kort_html(r), unsafe_allow_html=True)
+                        if _fundamental_gate(r, st.session_state.fundamentals):
+                            st.rerun()
+                        _detaljer(r)
+                    elif sone["form"] == "medium":
+                        st.markdown(medium_rad_html(r), unsafe_allow_html=True)
+                        if _detaljer(r, st.session_state.fundamentals):
+                            st.rerun()
+                    else:
+                        st.markdown(kompakt_rad_html(r), unsafe_allow_html=True)
+                        if _detaljer(r, st.session_state.fundamentals):
+                            st.rerun()
+
+        st.markdown(f'<div style="height:1px;background:{DC["linje"]};margin:24px 0 8px;"></div>',
+                    unsafe_allow_html=True)
+        _fotnote()
+        st.markdown(
+            f'<div style="font-family:{MONO};font-size:10px;letter-spacing:0.1em;'
+            f'color:{DC["svak"]};margin-top:14px;">CORRECTION RADAR · '
+            f'{len(resultater)} SELSKAPER · {SCANNER_CONFIG["historyYears"]} ÅRS HISTORIKK · '
+            f'INGEN KJØPS- ELLER SALGSSIGNALER</div>', unsafe_allow_html=True)
+
+    with rail:
+        _rail(resultater, st.session_state.radar_state)
 
 
 if __name__ == "__main__":
