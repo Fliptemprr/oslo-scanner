@@ -1868,6 +1868,16 @@ def injiser_css(rad_farger: dict = None, valgt: str = None) -> None:
   }}
   .st-key-gate {{ border-top: 1px solid {DC['linje']}; padding-top: 10px; margin-top: 6px; }}
 
+  /* Tabellen: monospace, tette rader, terminal-farger */
+  [data-testid="stDataFrame"] {{ border: 1px solid {DC['linje']}; border-radius: 6px; }}
+  [data-testid="stDataFrame"] [data-testid="stTable"] {{ font-family: {MONO}; }}
+  [data-testid="stDataFrame"] * {{ font-family: {MONO} !important; font-size: 12px; }}
+  [data-testid="stDataFrame"] [role="columnheader"] {{
+    font-size: 9px !important; letter-spacing: 0.11em; color: {DC['svakest']};
+    text-transform: uppercase;
+  }}
+  [data-testid="stDataFrame"] [role="row"]:hover {{ background: {DC['panel']}; }}
+
   ::-webkit-scrollbar {{ width: 10px; height: 10px; }}
   ::-webkit-scrollbar-track {{ background: {DC['bg']}; }}
   ::-webkit-scrollbar-thumb {{ background: {DC['kant']}; border-radius: 5px; }}
@@ -1984,73 +1994,100 @@ def varselrader(nye: list) -> str:
             f'{"".join(rader)}</div>')
 
 
-def tabell_html(resultater: list, valgt: str = None) -> str:
-    """Tett tabell med statusfarge som venstre-spine. Valgt rad er markert."""
-    kolonner = [("TICKER", "left"), ("NAVN", "left"), ("STATUS", "left"),
-                ("CORR", "right"), ("TREND", "right"), ("RECOV", "right"),
-                ("KORR %", "right"), ("PCTL", "right"), ("DAGER", "right"),
-                ("KURS", "right"), ("% I DAG", "right"), ("RSI", "right"),
-                ("VOL R", "right"), ("F", "center")]
-    hoder = "".join(
-        f'<th style="text-align:{a};padding:0 10px 9px;font-family:{MONO};'
-        f'font-size:9px;letter-spacing:0.11em;font-weight:400;color:{DC["svakest"]};'
-        f'white-space:nowrap;">{k}</th>' for k, a in kolonner)
-
-    rader, tynn_finnes = [], False
+def tabell_rader(resultater: list) -> pd.DataFrame:
+    """Tabellen som DataFrame, slik at rader kan klikkes."""
+    rader = []
     for r in resultater:
         cc, ind = r.get("currentCorrection"), r["ind"]
-        farge = STATUS_FARGE[r["status"]]
-        dempet = r["status"] == STATUS_WAIT
-        tf = DC["svak"] if dempet else DC["tekst"]
-        radbg = DC["panel"] if r["ticker"] == valgt else "transparent"
-        pct = f"{r['correctionPercentile']:.0f}"
+        navn = r["Navn"]
         if r["tynnHistorikk"]:
-            pct += "*"
-            tynn_finnes = True
-        d1 = ind.get("return1d")
+            navn += " · tynn historikk"
+        status = STATUS_KORT[r["status"]]
+        if reversal_blokkert(r):
+            status += " · GATE"
+        rader.append({
+            "": "▌",                       # statusspine
+            "TICKER": r["Ticker"],
+            "NAVN": navn,
+            "STATUS": status,
+            "CORR": r["correctionScore"],
+            "TREND": r["trendScore"],
+            "RECOV": r["recoveryScore"],
+            "KORR %": -cc.drawdownPct if cc else None,
+            "PCTL": r["correctionPercentile"],
+            "DAGER": cc.daysSincePeak if cc else None,
+            "KURS": ind["close_now"],
+            "% I DAG": ind["return1d"],
+            "RSI": round(ind["rsi"], 1) if ind["rsi"] else None,
+            "VOL R": ind["volumeRatio20d"],
+            "F": "✓" if r["fundamentalsChecked"] else "",
+        })
+    return pd.DataFrame(rader)
 
-        def c(v, align="right", fg=None, mono=True):
-            return (f'<td style="padding:9px 10px;text-align:{align};'
-                    f'font-family:{MONO if mono else SANS};font-size:12px;'
-                    f'color:{fg or tf};white-space:nowrap;'
-                    f'border-bottom:1px solid {DC["linje"]};">{v}</td>')
 
-        navn = _esc(r["Navn"])
-        if r["tynnHistorikk"]:
-            navn += f' <span style="color:{DC["orange"]};">· tynn historikk</span>'
+def tabell_stil(df: pd.DataFrame, resultater: list):
+    """
+    Fargelegger tabellen. Spinekolonnen «▌» får statusfargen, som gir samme
+    venstre-spine som mockupen uten å ofre klikkbare rader.
+    """
+    farger = [STATUS_FARGE[r["status"]] for r in resultater]
+    dempet = [r["status"] == STATUS_WAIT for r in resultater]
 
-        rader.append(
-            f'<tr style="background:{radbg};">'
-            f'<td style="padding:0;width:3px;background:{farge};'
-            f'border-bottom:1px solid {DC["linje"]};"></td>'
-            + c(f'<span style="font-weight:600;">{_esc(r["Ticker"])}</span>', "left")
-            + c(navn, "left", DC["dempet"], mono=False)
-            + c(badge(r["status"], kort=True)
-                + (gate_pille() if reversal_blokkert(r) else ""), "left")
-            + c(f"{r['correctionScore']:.0f}", fg=farge if not dempet else None)
-            + c(f"{r['trendScore']:.0f}")
-            + c(f"{r['recoveryScore']:.0f}")
-            + c(f"-{f(cc.drawdownPct, 1)}" if cc else "—",
-                fg=DC["orange"] if cc and not dempet else None)
-            + c(pct) + c(cc.daysSincePeak if cc else "—")
-            + c(f(ind["close_now"]))
-            + c(f(d1, 2), fg=(DC["gronn"] if d1 >= 0 else DC["roed"])
-                if d1 is not None and not dempet else None)
-            + c(f(ind["rsi"], 1))
-            + c(f(ind["volumeRatio20d"]), fg=DC["blaa"]
-                if (ind.get("volumeRatio20d") or 0) >= 2 and not dempet else None)
-            + c("✓" if r["fundamentalsChecked"] else "—", "center",
-                DC["gronn"] if r["fundamentalsChecked"] else None)
-            + '</tr>')
+    def per_rad(kolonne, velg):
+        return [velg(i) for i in range(len(kolonne))]
 
-    fot = "* TYNN HISTORIKK — PERCENTILEN ER LITE PÅLITELIG · " if tynn_finnes else ""
-    return (f'<div style="overflow-x:auto;">'
-            f'<table style="width:100%;border-collapse:collapse;">'
-            f'<thead><tr><th style="width:3px;padding:0;"></th>{hoder}</tr></thead>'
-            f'<tbody>{"".join(rader)}</tbody></table></div>'
-            f'<div style="padding:10px 4px;font-family:{MONO};font-size:10px;'
-            f'letter-spacing:0.06em;color:{DC["svakest"]};">'
+    sty = df.style
+    sty = sty.apply(lambda k: per_rad(k, lambda i: f"color: {farger[i]}"),
+                    subset=["", "STATUS", "CORR"])
+    sty = sty.apply(lambda k: per_rad(
+        k, lambda i: f"color: {DC['svak'] if dempet[i] else DC['tekst']}"),
+        subset=["TICKER", "TREND", "RECOV", "PCTL", "DAGER", "KURS", "RSI"])
+    sty = sty.apply(lambda k: per_rad(k, lambda i: f"color: {DC['dempet']}"),
+                    subset=["NAVN"])
+    sty = sty.apply(lambda k: per_rad(
+        k, lambda i: f"color: {DC['svak'] if dempet[i] else DC['orange']}"),
+        subset=["KORR %"])
+    sty = sty.apply(lambda k: [
+        f"color: {DC['svak'] if dempet[i] else (DC['gronn'] if (v or 0) >= 0 else DC['roed'])}"
+        for i, v in enumerate(k)], subset=["% I DAG"])
+    sty = sty.apply(lambda k: [
+        f"color: {DC['blaa'] if (v or 0) >= SCANNER_CONFIG['volume']['eventRatio'] else DC['dempet']}"
+        for v in k], subset=["VOL R"])
+    sty = sty.apply(lambda k: [f"color: {DC['gronn'] if v else DC['svakest']}" for v in k],
+                    subset=["F"])
+    return sty.format({
+        "CORR": "{:.0f}", "TREND": "{:.0f}", "RECOV": "{:.0f}", "PCTL": "{:.0f}",
+        "KORR %": "{:.1f}", "KURS": "{:.2f}", "% I DAG": "{:+.2f}",
+        "RSI": "{:.1f}", "VOL R": "{:.2f}", "DAGER": "{:.0f}",
+    }, na_rep="—")
+
+
+TABELL_KOLONNER = {
+    "": st.column_config.TextColumn("", width=6),
+    "TICKER": st.column_config.TextColumn("TICKER", width=72),
+    "NAVN": st.column_config.TextColumn("NAVN", width=170),
+    "STATUS": st.column_config.TextColumn("STATUS", width=150),
+    "CORR": st.column_config.NumberColumn("CORR", width=58),
+    "TREND": st.column_config.NumberColumn("TREND", width=62),
+    "RECOV": st.column_config.NumberColumn("RECOV", width=62),
+    "KORR %": st.column_config.NumberColumn("KORR %", width=68),
+    "PCTL": st.column_config.NumberColumn("PCTL", width=56),
+    "DAGER": st.column_config.NumberColumn("DAGER", width=62),
+    "KURS": st.column_config.NumberColumn("KURS", width=76),
+    "% I DAG": st.column_config.NumberColumn("% I DAG", width=70),
+    "RSI": st.column_config.NumberColumn("RSI", width=56),
+    "VOL R": st.column_config.NumberColumn("VOL R", width=62),
+    "F": st.column_config.TextColumn("F", width=34),
+}
+
+
+def tabell_fotnote(resultater: list) -> str:
+    tynn = any(r["tynnHistorikk"] for r in resultater)
+    fot = "* TYNN HISTORIKK — PERCENTILEN ER LITE PÅLITELIG · " if tynn else ""
+    return (f'<div style="padding:8px 4px;font-family:{MONO};font-size:10px;'
+            f'letter-spacing:0.06em;color:{DC["svakest"]};">KLIKK EN RAD FOR DETALJER · '
             f'{fot}RADAREN GIR INGEN KJØPS- ELLER SALGSSIGNALER</div>')
+
 
 
 def panel_topp_html(r: dict) -> str:
@@ -2617,7 +2654,26 @@ def main() -> None:
                     f'{", ".join(t.replace(".OL", "") for t in manglende)}</div>')
 
         if (visning or "TABELL") == "TABELL":
-            st.html(tabell_html(synlig, st.session_state.valgt))
+            valgt_pos = next((i for i, r in enumerate(synlig)
+                              if r["ticker"] == st.session_state.valgt), None)
+            # Sortering og WAIT-filter inngår i nøkkelen. Ellers ville et lagret
+            # radvalg overlevd en sorteringsendring og plutselig pekt på en
+            # annen aksje enn den du klikket på.
+            hendelse = st.dataframe(
+                tabell_stil(tabell_rader(synlig), synlig),
+                key=f"tabell-{sortering}-{vis_wait}",
+                on_select="rerun", selection_mode="single-row",
+                hide_index=True, width="stretch", row_height=34,
+                height=min(len(synlig) * 34 + 40, 700),
+                column_config=TABELL_KOLONNER,
+                selection_default={"selection": {"rows": [valgt_pos]}}
+                if valgt_pos is not None else None,
+            )
+            traff = hendelse.selection.rows if hendelse and hendelse.selection else []
+            if traff and synlig[traff[0]]["ticker"] != st.session_state.valgt:
+                st.session_state.valgt = synlig[traff[0]]["ticker"]
+                st.rerun()
+            st.html(tabell_fotnote(synlig))
         else:
             for sone in SONER:
                 i_sone = [r for r in synlig if r["status"] in sone["statuser"]]
