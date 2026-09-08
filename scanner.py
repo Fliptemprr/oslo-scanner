@@ -2185,6 +2185,7 @@ def flett_inn_kilde(basis: pd.DataFrame, ny: pd.DataFrame,
 
 
 def topp_opp_fra_stooq(alle: dict, forventet: date, session,
+                       diag: Optional[dict] = None,
                        cfg: dict = SCANNER_CONFIG) -> tuple:
     """Siste utvei når Yahoo ikke har siste avsluttede handelsdag."""
     if not cfg["data"]["stooqEnabled"]:
@@ -2198,20 +2199,33 @@ def topp_opp_fra_stooq(alle: dict, forventet: date, session,
     log.info(f"Prøver Stooq for {len(mangler)} tickere som mangler {forventet}")
     fikset = []
     for t in mangler:
+        d = diag.setdefault(t, {}) if diag is not None else {}
         try:
-            ny = hent_stooq(t, session, cfg)
+            url = STOOQ_URL.format(symbol=stooq_symbol(t))
+            tekst = _hent_url(url, session, cfg["data"]["stooqTimeout"])
+            if not tekst:
+                d["stooq"] = "ingen respons"
+                log.warning(f"[{t}] Stooq: ingen respons")
+                continue
+            d["stooqSvar"] = tekst.split("\n")[0][:60]
+            ny = parse_stooq_csv(tekst)
             if ny is None:
+                d["stooq"] = f"ikke CSV: {d['stooqSvar']}"
                 log.warning(f"[{t}] Stooq ga ikke brukbare data")
                 continue
+            d["stooq"] = f"siste {_bar_dato(ny)}"
             slaatt, grunn = flett_inn_kilde(alle[t], ny, cfg)
             if grunn:
+                d["stooq"] += f" — ikke flettet: {grunn}"
                 log.warning(f"[{t}] Stooq ikke flettet inn: {grunn}")
                 continue
             alle[t] = slaatt
             fikset.append(t)
+            d["stooq"] += f" — flettet, skalering {slaatt.attrs.get('skalering')}"
             log.info(f"[{t}] Stooq toppet opp til {_bar_dato(slaatt)} "
                      f"(skalering {slaatt.attrs.get('skalering')})")
         except Exception as e:
+            d["stooq"] = f"feil: {type(e).__name__}: {e}"[:120]
             log.warning(f"[{t}] Stooq feilet: {type(e).__name__}: {e}")
     return alle, fikset
 
@@ -2234,6 +2248,7 @@ def _hent_siste_dager(ticker: str, session, dager: int = 10) -> Optional[pd.Data
 
 
 def topp_opp_siste_dager(alle: dict, forventet: date, session,
+                         diag: Optional[dict] = None,
                          cfg: dict = SCANNER_CONFIG) -> tuple:
     """
     Hovednedlastingen kan komme tilbake uten siste avsluttede handelsdag.
@@ -2252,12 +2267,16 @@ def topp_opp_siste_dager(alle: dict, forventet: date, session,
              f"henter siste dager separat")
     fikset = []
     for t in mangler:
+        d = diag.setdefault(t, {}) if diag is not None else {}
         try:
             ny = _hent_siste_dager(t, session)
             if ny is None or ny.empty:
+                d["yahooPeriod"] = "tomt svar"
                 continue
+            d["yahooPeriod"] = f"siste {_bar_dato(ny)}"
             nye_rader = ny[ny.index > alle[t].index[-1]]
             if nye_rader.empty:
+                d["yahooPeriod"] += " (ingen nyere barer)"
                 continue
             slaatt = pd.concat([alle[t], nye_rader]).sort_index()
             slaatt = slaatt[~slaatt.index.duplicated(keep="first")]
@@ -2266,6 +2285,7 @@ def topp_opp_siste_dager(alle: dict, forventet: date, session,
             log.info(f"[{t}] toppet opp til {_bar_dato(slaatt)}")
             time.sleep(RETRY_DELAY_PER_TICKER)
         except Exception as e:
+            d["yahooPeriod"] = f"feil: {type(e).__name__}: {e}"[:120]
             log.warning(f"[{t}] topp-opp feilet: {type(e).__name__}: {e}")
     return alle, fikset
 
@@ -2293,7 +2313,7 @@ def _retry_missing(missing: list, session, start, end) -> dict:
 
 
 @st.cache_data(ttl=600, show_spinner=False)
-def hent_prisdata(tickers: tuple, handelsdag: Optional[date] = None) -> dict:
+def hent_prisdata(tickers: tuple, handelsdag: Optional[date] = None) -> tuple:
     """
     Last ned daglig OHLCV for watchlisten. Kun rådata caches – scoringen
     kjøres på nytt ved hver rerun, slik at fundamental-avkrysning slår
@@ -2303,8 +2323,9 @@ def hent_prisdata(tickers: tuple, handelsdag: Optional[date] = None) -> dict:
     over et døgnskifte servere gårsdagens nedlasting videre.
     """
     liste = list(tickers)
+    diag: dict = {"_sesjon": "curl_cffi" if _lag_session() is not None else "urllib"}
     if not liste:
-        return {}
+        return {}, diag
 
     # end er eksklusiv hos yfinance, og Streamlit Cloud kjører i UTC. Med
     # end = now falt siste avsluttede handelsdag utenfor vinduet i døgnskiftet.
@@ -2331,13 +2352,16 @@ def hent_prisdata(tickers: tuple, handelsdag: Optional[date] = None) -> dict:
         time.sleep(BATCH_DELAY)
         alle.update(_retry_missing(mangler, session, start, end))
 
+    for t, df in alle.items():
+        diag.setdefault(t, {})["yahooBatch"] = str(_bar_dato(df))
+
     # Mangler siste avsluttede handelsdag, prøv en kort period-forespørsel.
     forventet = handelsdag or siste_avsluttede_handelsdag()
     bak = [t for t, df in alle.items()
            if _bar_dato(df) is not None and _bar_dato(df) < forventet]
     if bak:
         progress.progress(0.97, text=f"Henter siste handelsdag for {len(bak)}...")
-        alle, fikset = topp_opp_siste_dager(alle, forventet, session)
+        alle, fikset = topp_opp_siste_dager(alle, forventet, session, diag)
         if fikset:
             log.info(f"Toppet opp {len(fikset)} tickere til {forventet}")
 
@@ -2346,13 +2370,20 @@ def hent_prisdata(tickers: tuple, handelsdag: Optional[date] = None) -> dict:
                     if _bar_dato(df) is not None and _bar_dato(df) < forventet]
         if fortsatt:
             progress.progress(0.99, text=f"Stooq for {len(fortsatt)}...")
-            alle, fra_stooq = topp_opp_fra_stooq(alle, forventet, session)
+            alle, fra_stooq = topp_opp_fra_stooq(alle, forventet, session, diag)
             if fra_stooq:
                 log.info(f"Stooq dekket {len(fra_stooq)} tickere")
 
+    for t in liste:
+        d = diag.setdefault(t, {})
+        d["endelig"] = str(_bar_dato(alle[t])) if t in alle else "ingen data"
+        d.setdefault("yahooBatch", "ingen data")
+        d.setdefault("yahooPeriod", "ikke forsøkt")
+        d.setdefault("stooq", "ikke forsøkt")
+
     progress.empty()
     log.info(f"Lastet ned {len(alle)}/{len(liste)} aksjer")
-    return alle
+    return alle, diag
 
 
 def kjor_scan(prisdata: dict, fund_store: dict, state: Optional[dict] = None,
@@ -3499,6 +3530,73 @@ def _hoyrepanel(r: dict, fund_store: dict, dstatus: dict = None) -> bool:
     return endret
 
 
+def _kildediagnose(diag: dict, dstatus: dict) -> None:
+    """
+    Hva hver kilde faktisk svarte, per ticker.
+
+    Uten dette svelges feilene i logger som ikke er synlige fra appen, og
+    feilsøking blir gjetting.
+    """
+    rader = []
+    for t in sorted(k for k in diag if not k.startswith("_")):
+        d = diag[t]
+        rader.append({
+            "Ticker": t.replace(".OL", ""),
+            "Yahoo batch": d.get("yahooBatch", "—"),
+            "Yahoo period": d.get("yahooPeriod", "—"),
+            "Stooq": d.get("stooq", "—"),
+            "Brukt": d.get("endelig", "—"),
+        })
+    if not rader:
+        return
+
+    with st.expander("DATAKILDER — DIAGNOSE"):
+        st.caption(
+            f"Forventet siste avsluttede handelsdag: {dstatus['forventet']} · "
+            f"HTTP-klient: {diag.get('_sesjon', '?')}. "
+            "«Yahoo batch» er den lange datointervall-forespørselen, "
+            "«Yahoo period» den korte, «Stooq» andrekilden."
+        )
+        st.dataframe(pd.DataFrame(rader), width="stretch", hide_index=True,
+                     height=min(len(rader) * 36 + 40, 400))
+
+        st.caption("Test én ticker direkte mot begge kilder:")
+        c = st.columns([2, 1])
+        valgt = c[0].selectbox("Ticker", sorted(k for k in diag if not k.startswith("_")),
+                               label_visibility="collapsed")
+        if c[1].button("TEST KILDER", width="stretch"):
+            _kildetest(valgt)
+
+
+def _kildetest(ticker: str) -> None:
+    """Kjør ticker mot hver kilde og vis råsvaret. Ren feilsøking."""
+    session = _lag_session()
+    st.write(f"**{ticker}** — curl_cffi: {session is not None}")
+
+    try:
+        y = _hent_siste_dager(ticker, session)
+        st.write(f"Yahoo period=10d: "
+                 + (f"{len(y)} rader, siste {_bar_dato(y)}" if y is not None and not y.empty
+                    else "tomt svar"))
+    except Exception as e:
+        st.write(f"Yahoo period=10d feilet: `{type(e).__name__}: {e}`")
+
+    url = STOOQ_URL.format(symbol=stooq_symbol(ticker))
+    st.write(f"Stooq URL: `{url}`")
+    try:
+        tekst = _hent_url(url, session, SCANNER_CONFIG["data"]["stooqTimeout"])
+        if not tekst:
+            st.write("Stooq: ingen respons")
+        else:
+            st.code("\n".join(tekst.split("\n")[:4]), language="text")
+            s_df = parse_stooq_csv(tekst)
+            st.write(f"Tolket: "
+                     + (f"{len(s_df)} rader, siste {_bar_dato(s_df)}"
+                        if s_df is not None else "kunne ikke tolkes som CSV"))
+    except Exception as e:
+        st.write(f"Stooq feilet: `{type(e).__name__}: {e}`")
+
+
 def _fotnote() -> None:
     c = SCANNER_CONFIG
     with st.expander("SLIK VIRKER RADAREN"):
@@ -3567,7 +3665,7 @@ def main() -> None:
         return
 
     forventet_dag = siste_avsluttede_handelsdag()
-    prisdata = hent_prisdata(tuple(sorted(aktive)), forventet_dag)
+    prisdata, kildediag = hent_prisdata(tuple(sorted(aktive)), forventet_dag)
     prisdata = rens_prisdata(prisdata)
     dstatus = datastatus(prisdata)
     resultater = (kjor_scan(prisdata, st.session_state.fundamentals,
@@ -3667,6 +3765,8 @@ def main() -> None:
                     st.html(kort_html(r, sone["form"]))
 
         st.html(f'<div style="height:1px;background:{DC["linje"]};margin:18px 0 8px;"></div>')
+        if dstatus["stale"]:
+            _kildediagnose(kildediag, dstatus)
         _fotnote()
 
     with panel:

@@ -369,20 +369,30 @@ krav("P0", "Uten overlappende datoer flettes ingenting inn",
      "skalering krever en felles dato å ankre mot, ellers er nivåene ukjente")
 
 # Hele kjeden: Yahoo mangler, Stooq redder
-_ekte_stooq = S.hent_stooq
-S.hent_stooq = lambda t, session=None, cfg=None: S.parse_stooq_csv(
-    stooq_csv(ferskt[t].tail(40), UJUSTERT))
+# Patcher på HTTP-nivå, slik at CSV-tolkning og skalering også testes
+_ekte_url = S._hent_url
+
+
+def _falsk_url(url, session, timeout):
+    sym = url.split("s=")[1].split("&")[0]          # kog.ol
+    tick = sym.upper()                               # KOG.OL
+    return stooq_csv(ferskt[tick].tail(40), UJUSTERT)
+
+
+S._hent_url = _falsk_url
 try:
     kjede = {t: df.copy() for t, df in gammelt.items()}
-    kjede, fra_stooq = S.topp_opp_fra_stooq(kjede, date(2026, 9, 7), None)
+    diag = {}
+    kjede, fra_stooq = S.topp_opp_fra_stooq(kjede, date(2026, 9, 7), None, diag)
     st_kjede = S.datastatus(kjede, naa)
 finally:
-    S.hent_stooq = _ekte_stooq
+    S._hent_url = _ekte_url
 krav("P0", "Stooq dekker inn når Yahoo ikke leverer siste handelsdag",
      not st_kjede["stale"] and set(fra_stooq) == {"KOG.OL", "KIT.OL"},
      f"Yahoo t.o.m. 04.09 → Stooq toppet opp "
      f"{sorted(t.replace('.OL','') for t in fra_stooq)} → "
-     f"siste data {st_kjede['faktisk']}, stale={st_kjede['stale']}")
+     f"siste data {st_kjede['faktisk']}, stale={st_kjede['stale']}\n    "
+     f"diagnose: {diag['KOG.OL']['stooq']}")
 
 
 # Scores skal faktisk endre seg når siste dag kommer inn
