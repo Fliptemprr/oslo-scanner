@@ -227,6 +227,36 @@ SCANNER_CONFIG: dict[str, Any] = {
         "backfillTimeout": 20,
     },
 
+    # ── Corporate actions ──
+    # Yahoo justerer for utbytte og splitt, men IKKE for fisjon/spin-off.
+    # KOG falt 398.50 → 328.38 ved åpning 15.04.2026, med 15.04 sin high under
+    # 14.04 sin low: hele bevegelsen lå mellom to sesjoner. Uten justering
+    # leses utskillelsen av Kongsberg Maritime som et markedsfall på 16 %, og
+    # forurenser topp, drawdown, percentil, ATR, SMA200 og Trend Score.
+    #
+    # Faktoren skalerer alle barer FØR exDato. Volum røres ikke: ved fisjon
+    # endres ikke antall aksjer i selskapet det fisjoneres fra. Dagens kurs
+    # står alltid urørt, så UI-et viser faktisk markedskurs.
+    #
+    # Tabellen er bevisst eksplisitt. Automatisk gap-deteksjon ble vurdert og
+    # valgt bort: watchlisten har 15 andre gap uten overlapp mellom dagene som
+    # er ekte resultatreaksjoner, og de skal telle som korreksjoner.
+    "corporateActions": {
+        "KOG.OL": [
+            {
+                "exDato": "2026-04-15",
+                "faktor": 0.83789,
+                "kort": "fisjon av Kongsberg Maritime",
+                "note": "Fisjon Kongsberg Maritime (KMAR.OL), 1:1. Utledet av "
+                        "(398.50 - 64.60) / 398.50, der 64.60 er KMARs første "
+                        "omsetning 23.04.2026. Gir topp 349.90, som stemmer "
+                        "med den bakoverjusterte serien hos Nordnet og "
+                        "Finansavisen. Bytt til Oslo Børs' offisielle faktor "
+                        "når den er bekreftet.",
+            },
+        ],
+    },
+
     # ── §32/§33: varsler ──
     "alerts": {
         "severityStepPct": 3.0,
@@ -1637,6 +1667,7 @@ def scan_stock(ticker: str, df: pd.DataFrame, fund_store: dict,
     resultat.update({
         "correctionId": cc.correctionId,
         "currentCorrection": cc,
+        "corporateActions": list(df.attrs.get("corporateActions", [])),
         "correctionPercentile": percentile,
         "historiskeKorreksjoner": historikk,
         "antallHistoriske": n_hist,
@@ -2018,6 +2049,62 @@ def manglende_handelsdager(df: pd.DataFrame, forventet: date,
             ut.append(d)
         d = forrige_handelsdag(d)
     return sorted(ut)
+
+
+def _juster_serie(df: pd.DataFrame, hendelser: list) -> pd.DataFrame:
+    """Skaler barer før hver ex-dato. Flere hendelser komponeres."""
+    d = df.copy()
+    brukt = []
+    for h in hendelser:
+        faktor = _num(h.get("faktor"))
+        if faktor is None or faktor <= 0 or faktor == 1.0:
+            continue
+        ex = pd.Timestamp(h["exDato"])
+        maske = d.index < ex
+        if not maske.any():
+            continue
+        for kol in ("Open", "High", "Low", "Close"):
+            if kol in d.columns:
+                d.loc[maske, kol] = d.loc[maske, kol] * faktor
+        brukt.append({"exDato": h["exDato"], "faktor": faktor,
+                      "kort": h.get("kort", "corporate action"),
+                      "note": h.get("note", ""), "barer": int(maske.sum())})
+
+    d.attrs = dict(df.attrs)
+    if brukt:
+        d.attrs["corporateActions"] = brukt
+    return d
+
+
+def juster_corporate_actions(prisdata: dict, cfg: dict = SCANNER_CONFIG) -> dict:
+    """
+    Sett historikken på samme grunnlag som dagens kurs over corporate actions.
+
+    Yahoo justerer for utbytte og splitt, men ikke for fisjon. Da sammenlignes
+    en kurs som inneholdt et utskilt selskap med en kurs som ikke gjør det, og
+    differansen leses som et markedsfall. For KOG betyr det 34.8 % drawdown der
+    det reelle er 22.2 %, en oppdiktet korreksjon på 27 % i historikken
+    percentilen måles mot, og en SMA200 så høy at Trend Score aldri kommer over
+    REVERSAL-terskelen.
+
+    Kun historiske barer flyttes. Dagens kurs står urørt, slik at UI-et viser
+    faktisk markedskurs mens sammenligninger går på justert grunnlag.
+    """
+    tabell = cfg.get("corporateActions") or {}
+    if not tabell:
+        return prisdata
+
+    ut = {}
+    for t, df in prisdata.items():
+        hendelser = tabell.get(t)
+        if not hendelser or df is None or len(df) == 0:
+            ut[t] = df
+            continue
+        ut[t] = _juster_serie(df, hendelser)
+        for h in ut[t].attrs.get("corporateActions", []):
+            log.info(f"[{t}] justerte {h['barer']} barer før {h['exDato']} "
+                     f"med faktor {h['faktor']}")
+    return ut
 
 
 def rens_prisdata(prisdata: dict, naa: Optional[datetime] = None,
@@ -3396,6 +3483,9 @@ def korreksjonsforlop_html(r: dict) -> str:
 
     w = SCANNER_CONFIG["correctionScoreWeights"]
     pil = f'<div style="color:{DC["kant"]};align-self:center;">→</div>'
+    # Ligger toppen før en corporate action, er den vist på justert grunnlag
+    ca = next((h for h in r.get("corporateActions", [])
+               if str(cc.peakDate) < h["exDato"]), None)
     z = r.get("supportSone")
     if z:
         stotte = (f'<span style="font-family:{MONO};">Støttesone {f(z["nivå"])} '
@@ -3428,6 +3518,11 @@ def korreksjonsforlop_html(r: dict) -> str:
            + ", ".join(v for k, v in EVENT_ETIKETTER.items() if r["eventGrunner"].get(k))
            + f'. Målt mot ATR {f(r["ind"]["atrPctPrev"], 2)} % fra dagen før hendelsen.'
            f'</div>' if r["eventRisk"] else "")
+        + (f'<div style="margin-top:10px;font-size:11px;color:{DC["svak"]};'
+           f'line-height:1.5;">Kurser før {ca["exDato"]} er skalert med '
+           f'{ca["faktor"]} — {_esc(ca.get("kort", "corporate action"))}. Toppen vises '
+           f'derfor på justert grunnlag, sammenlignbart med dagens kurs. '
+           f'NÅ er faktisk markedskurs.</div>' if ca else "")
     )
 
 
@@ -3918,6 +4013,8 @@ def main() -> None:
     forventet_dag = siste_avsluttede_handelsdag()
     prisdata, kildediag = hent_prisdata(tuple(sorted(aktive)), forventet_dag)
     prisdata = rens_prisdata(prisdata)
+    # Historikken må stå på samme grunnlag som dagens kurs før noe sammenlignes
+    prisdata = juster_corporate_actions(prisdata)
     dstatus = datastatus(prisdata)
     resultater = (kjor_scan(prisdata, st.session_state.fundamentals,
                             st.session_state.radar_state) if prisdata else [])

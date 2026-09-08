@@ -575,6 +575,119 @@ krav("P0", "Manglende handelsdag påvirker mer enn KURS og % I DAG",
      "derfor er STALE et blokkerende varsel, ikke en fotnote")
 
 
+# ── Corporate actions: fisjon skal ikke telle som kursfall ──
+# Yahoo justerer for utbytte og splitt, men IKKE for fisjon. KOG falt
+# 398.50 → 328.38 ved åpning 15.04.2026, med 15.04 sin high under 14.04 sin
+# low: hele bevegelsen lå mellom to sesjoner. Utskillelsen av Kongsberg
+# Maritime ble dermed lest som et markedsfall på 16 %, og forurenset topp,
+# drawdown, percentil, ATR, SMA200 og Trend Score.
+
+CA_EX = "2026-04-15"
+CA_FAKTOR = 0.8
+CA_CFG = copy.deepcopy(S.SCANNER_CONFIG)
+CA_CFG["corporateActions"] = {
+    "TEST.OL": [{"exDato": CA_EX, "faktor": CA_FAKTOR, "note": "syntetisk fisjon"}]
+}
+
+ca_raa = serie_til(date(2026, 9, 7), n=400)
+ca_just = S.juster_corporate_actions({"TEST.OL": ca_raa.copy()}, CA_CFG)["TEST.OL"]
+ca_for = ca_just.index < pd.Timestamp(CA_EX)
+
+krav("P0", "Corporate action skalerer historikken, men ikke dagens kurs",
+     bool((ca_just.loc[ca_for, "Close"] / ca_raa.loc[ca_for, "Close"]
+           ).round(9).eq(CA_FAKTOR).all())
+     and ca_just.loc[~ca_for, "Close"].round(9).equals(
+         ca_raa.loc[~ca_for, "Close"].round(9))
+     and ca_just["Volume"].equals(ca_raa["Volume"])
+     and float(ca_just["Close"].iloc[-1]) == float(ca_raa["Close"].iloc[-1]),
+     f"{int(ca_for.sum())} barer før {CA_EX} skalert med {CA_FAKTOR}, "
+     f"{int((~ca_for).sum())} barer fra ex-dato urørt\n    "
+     f"siste kurs {float(ca_just['Close'].iloc[-1]):.2f} = faktisk markedskurs\n    "
+     f"volum urørt: ved fisjon endres ikke antall aksjer i selskapet")
+
+# Det kunstige fallet skal forsvinne helt
+ca_flat = pd.DataFrame(
+    {"Open": [100.0, 100.0, 80.0, 80.0], "High": [100.0, 100.0, 80.0, 80.0],
+     "Low": [100.0, 100.0, 80.0, 80.0], "Close": [100.0, 100.0, 80.0, 80.0],
+     "Volume": [1000, 1000, 1000, 1000]},
+    index=pd.to_datetime(["2026-04-13", "2026-04-14", "2026-04-15", "2026-04-16"]))
+ca_flat_j = S.juster_corporate_actions({"TEST.OL": ca_flat}, CA_CFG)["TEST.OL"]
+fall_for = (ca_flat["Close"].pct_change().iloc[2]) * 100
+fall_etter = (ca_flat_j["Close"].pct_change().iloc[2]) * 100
+krav("P0", "Det kunstige fisjonsfallet forsvinner fra kursutviklingen",
+     abs(fall_for + 20.0) < 1e-9 and abs(fall_etter) < 1e-9,
+     f"flat serie 100 → 80 over ex-dato: {fall_for:.1f} % før justering, "
+     f"{fall_etter:.1f} % etter\n    "
+     f"et reelt markedsfall samme dag ville overlevd, siden faktoren kun "
+     f"flytter nivået på historikken")
+
+# Flere hendelser skal komponeres, ikke overskrive hverandre
+CA_TO = copy.deepcopy(S.SCANNER_CONFIG)
+CA_TO["corporateActions"] = {"TEST.OL": [
+    {"exDato": "2025-06-02", "faktor": 0.5, "note": "eldst"},
+    {"exDato": CA_EX, "faktor": CA_FAKTOR, "note": "nyest"}]}
+ca_to = S.juster_corporate_actions({"TEST.OL": ca_raa.copy()}, CA_TO)["TEST.OL"]
+tidlig = ca_to.index < pd.Timestamp("2025-06-02")
+mellom = (ca_to.index >= pd.Timestamp("2025-06-02")) & (ca_to.index < pd.Timestamp(CA_EX))
+krav("P0", "Flere corporate actions komponeres i stedet for å overskrive",
+     bool((ca_to.loc[tidlig, "Close"] / ca_raa.loc[tidlig, "Close"]
+           ).round(9).eq(0.5 * CA_FAKTOR).all())
+     and bool((ca_to.loc[mellom, "Close"] / ca_raa.loc[mellom, "Close"]
+               ).round(9).eq(CA_FAKTOR).all()),
+     f"før begge: faktor {0.5 * CA_FAKTOR:.2f} · mellom dem: {CA_FAKTOR} · "
+     f"etter siste: 1.0")
+
+# Ticker uten hendelser skal ikke røres
+ca_urort = S.juster_corporate_actions({"ANNEN.OL": ca_raa.copy()}, CA_CFG)["ANNEN.OL"]
+krav("P0", "Tickere uten registrerte corporate actions står urørt",
+     ca_urort["Close"].equals(ca_raa["Close"]),
+     "tabellen er eksplisitt — automatisk gap-deteksjon er bevisst valgt bort, "
+     "fordi\n    watchlisten har 15 andre gap uten overlapp som er ekte "
+     "resultatreaksjoner")
+
+# Hele veien: forurenset historikk gir oppblåst topp, justering gir basis tilbake
+# Toppen må ligge FØR ex-datoen, slik den gjør for KOG: topp 09.04, fisjon
+# 15.04, og hele fallet deretter måles fra en topp som inneholdt KMAR.
+ca_basis = paalegg_fall(lag_df(n=600, sigma=1.5, drift=0.05, seed=7), 20, 100)
+ca_basis.index = pd.bdate_range(end=pd.Timestamp("2026-09-07"), periods=600)
+CA_EX2 = ca_basis.index[-95]
+ca_skitten = ca_basis.copy()
+_m = ca_skitten.index < CA_EX2
+for _k in ("Open", "High", "Low", "Close"):
+    ca_skitten.loc[_m, _k] = ca_skitten.loc[_m, _k] / CA_FAKTOR   # fisjonen «ujustert»
+
+CA_CFG2 = copy.deepcopy(S.SCANNER_CONFIG)
+CA_CFG2["corporateActions"] = {
+    "TEST.OL": [{"exDato": CA_EX2.strftime("%Y-%m-%d"), "faktor": CA_FAKTOR,
+                 "note": "syntetisk fisjon"}]}
+ca_renset = S.juster_corporate_actions({"TEST.OL": ca_skitten.copy()},
+                                       CA_CFG2)["TEST.OL"]
+
+r_basis = scan("TEST.OL", ca_basis)
+r_skitten = scan("TEST.OL", ca_skitten)
+r_renset = scan("TEST.OL", ca_renset)
+krav("P0", "Ujustert fisjon blåser opp topp og Trend, justering gir basis tilbake",
+     r_skitten["currentCorrection"].peakPrice > r_basis["currentCorrection"].peakPrice
+     and r_skitten["currentCorrection"].maxDrawdownPct
+         > r_basis["currentCorrection"].maxDrawdownPct
+     and r_skitten["trendScore"] < r_basis["trendScore"]
+     and abs(r_renset["currentCorrection"].peakPrice
+             - r_basis["currentCorrection"].peakPrice) < 1e-6
+     and abs(r_renset["currentCorrection"].maxDrawdownPct
+             - r_basis["currentCorrection"].maxDrawdownPct) < 1e-6
+     and r_renset["trendScore"] == r_basis["trendScore"]
+     and r_renset["correctionPercentile"] == r_basis["correctionPercentile"],
+     f"forurenset: topp {r_skitten['currentCorrection'].peakPrice:.2f} · "
+     f"max {r_skitten['currentCorrection'].maxDrawdownPct:.1f} % · "
+     f"trend {r_skitten['trendScore']:.0f}\n    "
+     f"justert:    topp {r_renset['currentCorrection'].peakPrice:.2f} · "
+     f"max {r_renset['currentCorrection'].maxDrawdownPct:.1f} % · "
+     f"trend {r_renset['trendScore']:.0f}\n    "
+     f"basis:      topp {r_basis['currentCorrection'].peakPrice:.2f} · "
+     f"max {r_basis['currentCorrection'].maxDrawdownPct:.1f} % · "
+     f"trend {r_basis['trendScore']:.0f}  (justeringen inverterer forurensningen)")
+
+
 # ── A: DNB vs NAS ──
 FALL = 7.0
 res = {t: scan(t, paalegg_fall(lag_df(**p), FALL, 18))

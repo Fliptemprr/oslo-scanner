@@ -27,7 +27,7 @@ egen historikk av korreksjoner, funnet med ATR-normalisert ZigZag. Et fall på
 | Fil | Innhold |
 |---|---|
 | `scanner.py` | Hele appen, ~3800 linjer. Config → typer → indikatorer → handelskalender → swings → scorer → motor → datahenting → UI |
-| `test_scanner.py` | 36 akseptansetester. Kjøres uten nett, med syntetiske kursserier |
+| `test_scanner.py` | 41 akseptansetester. Kjøres uten nett, med syntetiske kursserier |
 | `sjekk_data.py` | Frittstående diagnose av datakildene. Krever nett |
 | `.streamlit/config.toml` | Mørkt tema |
 | `README.md` | Kort produktbeskrivelse |
@@ -43,7 +43,7 @@ gitignorert. Streamlit Cloud har flyktig disk, så listen faller tilbake til
 1. **Ikke endre trading-logikken** — Correction Score, Trend Score, Recovery
    Score, phase, severity, statusmotoren, event risk — uten at brukeren
    eksplisitt gir nye regler. Masterspesifikasjonen styrer, ikke egne ideer.
-2. **`python test_scanner.py` skal være 36/36 før hver push.** Feiler noe,
+2. **`python test_scanner.py` skal være 41/41 før hver push.** Feiler noe,
    er det enten en reell regresjon eller en dårlig test. Begge må undersøkes,
    ingen av dem ignoreres.
 3. **`python -c "import ast; ast.parse(open('scanner.py').read())"` etter hver
@@ -124,6 +124,55 @@ tetter derfor ferske hull, styrt av `backfillMaxDays` (5). Eldre hull står
 igjen, og da blir STALE stående — som er riktig, for da er tallene faktisk
 ikke til å stole på.
 
+## 3b. Corporate actions — løst 08.09.2026
+
+Yahoo justerer for utbytte og splitt, men **ikke for fisjon**. KOG skilte ut
+Kongsberg Maritime (KMAR.OL) med ex-dato **15.04.2026** — ikke 22./23.04, som
+er noteringsdatoen for KMAR.
+
+```
+14.04   close 398.50   low  394.50
+15.04   open  328.38   high 328.63     ← gap -17.60 %, ingen overlapp
+```
+
+Hele bevegelsen lå mellom to sesjoner. Justeringsfaktoren fra Yahoo er
+`1.000000` etter 17.04, og de 1.4 % før skyldes kun utbyttet på 5.70 kr.
+
+Uten justering leste radaren fisjonen som et markedsfall:
+
+| | Ujustert | Justert |
+|---|---|---|
+| Aktiv topp | 417.60 | **349.90** |
+| Max drawdown | 34.79 % | **22.18 %** |
+| Percentil | 100 | **94** |
+| Trend Score | 30 | **75** |
+| SMA200 | 316.16 | **290.00** |
+
+Trend Score er den alvorligste: kurs 298.00 lå under SMA200 316.16, og siden
+REVERSAL krever Trend ≥ 55 kunne KOG **aldri** nå REVERSAL før fisjonen falt ut
+av SMA200-vinduet i februar 2027. Historikken var også forurenset — en
+oppdiktet korreksjon på 27.3 % (reelt 13.3 %) i fordelingen percentilen måles
+mot.
+
+**Faktoren 0.83789 er utledet, ikke offisiell:** `(398.50 - 64.60) / 398.50`,
+der 64.60 er KMARs første omsetning. Den gir topp 349.90, som stemmer med den
+bakoverjusterte serien hos Nordnet og Finansavisen. Bytt til Oslo Børs'
+offisielle faktor når den er bekreftet.
+
+Merk at close-til-close-fallet var -18.19 %, mens den rene fisjonsdelen er
+-16.21 %. De resterende ~2.4 % var ekte markedsbevegelse. Man kan derfor ikke
+justere med det observerte gapet.
+
+Tabellen `corporateActions` i `SCANNER_CONFIG` er **bevisst eksplisitt**.
+Automatisk gap-deteksjon ble vurdert og valgt bort: watchlisten har 15 andre
+gap uten overlapp mellom dagene, og de er resultatreaksjoner som skal telle som
+korreksjoner. Automatikk ville visket ut ekte fall.
+
+Volum røres ikke — ved fisjon endres ikke antall aksjer i selskapet det
+fisjoneres fra. Dagens kurs står alltid urørt, så UI-et viser faktisk
+markedskurs; detaljpanelet opplyser om justeringen der den historiske toppen
+vises.
+
 ## 4. Datahentingens arkitektur
 
 Kjeden i `hent_prisdata()`:
@@ -139,6 +188,8 @@ backfill_manglende_dager()   5m-barer aggregert til dagsbar,
                              close fra range=1d chartPreviousClose
         ↓
 rens_prisdata()   forkaster uferdig candle hvis vi står midt i sesjonen
+        ↓
+juster_corporate_actions()   skalerer historikken over fisjoner, se §3b
         ↓
 datastatus()      sammenligner mot siste_avsluttede_handelsdag()
 ```
@@ -233,7 +284,7 @@ eller sett gulvet til `False`.
 git pull
 # endre scanner.py
 python -c "import ast; ast.parse(open('scanner.py').read())"
-python test_scanner.py          # skal være 36/36
+python test_scanner.py          # skal være 41/41
 streamlit run scanner.py        # se på den
 git add -A && git commit -m "..." && git push
 ```
