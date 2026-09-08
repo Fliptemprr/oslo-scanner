@@ -162,6 +162,28 @@ def fjern_support_serie(seed=77):
     return legg_til_ben(d, 0.62, 70, sigma=0.35, seed=seed + 1)
 
 # ══════════════════════════════════════════════════════════════
+# HANDELSKALENDER OG DATAFRISKHET (P0)
+# ══════════════════════════════════════════════════════════════
+
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
+
+OSLO = ZoneInfo("Europe/Oslo")
+
+
+def serie_til(sluttdato, n=760, seed=5):
+    """Kursserie med siste bar på en gitt dato."""
+    d = lag_df(n=n, sigma=1.5, drift=0.05, seed=seed, start=100.0)
+    d.index = pd.bdate_range(end=pd.Timestamp(sluttdato), periods=len(d))
+    return d
+
+
+def uten_siste_bar(df):
+    """Samme serie som mangler siste handelsdag — slik feilen faktisk arter seg."""
+    return df.iloc[:-1]
+
+
+# ══════════════════════════════════════════════════════════════
 # AKSEPTANSETESTER §41 A–M
 # ══════════════════════════════════════════════════════════════
 
@@ -179,6 +201,82 @@ def scan(ticker, df, fund=None, state=None, cfg=None):
 
 GODKJENT = {"reportChecked": True, "guidanceChecked": True,
             "newsChecked": True, "thesisIntact": True}
+
+
+# ── P0: siste avsluttede handelsdag ──
+kalender = [
+    ("tirsdag 08.09 kl 07:00, før åpning", datetime(2026, 9, 8, 7, 0, tzinfo=OSLO),
+     date(2026, 9, 7)),
+    ("tirsdag 08.09 kl 12:00, midt i sesjonen", datetime(2026, 9, 8, 12, 0, tzinfo=OSLO),
+     date(2026, 9, 7)),
+    ("tirsdag 08.09 kl 17:30, etter stengetid", datetime(2026, 9, 8, 17, 30, tzinfo=OSLO),
+     date(2026, 9, 8)),
+    ("lørdag 12.09", datetime(2026, 9, 12, 10, 0, tzinfo=OSLO), date(2026, 9, 11)),
+    ("søndag 13.09", datetime(2026, 9, 13, 10, 0, tzinfo=OSLO), date(2026, 9, 11)),
+    ("2. påskedag 06.04", datetime(2026, 4, 6, 8, 0, tzinfo=OSLO), date(2026, 4, 1)),
+    ("1. januar", datetime(2026, 1, 1, 12, 0, tzinfo=OSLO), date(2025, 12, 30)),
+]
+feil_kal = [(n, S.siste_avsluttede_handelsdag(t), v) for n, t, v in kalender
+            if S.siste_avsluttede_handelsdag(t) != v]
+krav("P0", "Siste avsluttede handelsdag hopper over helg og børshelligdager",
+     not feil_kal,
+     "\n    ".join(f"{n:38s} → {S.siste_avsluttede_handelsdag(t)}"
+                    for n, t, _ in kalender))
+
+# Det konkrete tilfellet: skanning tirsdag morgen med data kun t.o.m. fredag
+naa = datetime(2026, 9, 8, 7, 0, tzinfo=OSLO)
+ferskt = {"KOG.OL": serie_til(date(2026, 9, 7)), "KIT.OL": serie_til(date(2026, 9, 7), seed=6)}
+gammelt = {t: uten_siste_bar(df) for t, df in ferskt.items()}
+st_gammel = S.datastatus(gammelt, naa)
+st_fersk = S.datastatus(ferskt, naa)
+krav("P0", "Data som mangler siste handelsdag flagges som STALE",
+     st_gammel["stale"] and not st_fersk["stale"]
+     and st_gammel["handelsdagerBak"] == 1
+     and set(st_gammel["etterslep"]) == {"KOG.OL", "KIT.OL"},
+     f"skanning tirsdag 08.09 kl 07:00 → forventet handelsdag "
+     f"{st_gammel['forventet']}\n    "
+     f"data t.o.m. 04.09 → stale={st_gammel['stale']}, "
+     f"{st_gammel['handelsdagerBak']} handelsdag bak, mangler "
+     f"{sorted(t.replace('.OL','') for t in st_gammel['etterslep'])}\n    "
+     f"data t.o.m. 07.09 → stale={st_fersk['stale']}")
+
+# Uferdig candle skal forkastes før noe beregnes
+i_sesjon = datetime(2026, 9, 8, 12, 0, tzinfo=OSLO)
+med_uferdig = {"KOG.OL": serie_til(date(2026, 9, 8))}
+renset = S.rens_prisdata(med_uferdig, i_sesjon)
+krav("P0", "Uferdig candle forkastes før scores beregnes",
+     S._bar_dato(renset["KOG.OL"]) == date(2026, 9, 7)
+     and len(renset["KOG.OL"]) == len(med_uferdig["KOG.OL"]) - 1
+     and not S.datastatus(renset, i_sesjon)["stale"],
+     f"skanning midt i sesjonen 08.09 kl 12:00: siste bar 08.09 (uferdig) "
+     f"→ forkastet, beregnes nå på {S._bar_dato(renset['KOG.OL'])}")
+
+# Etter stengetid skal dagens ferdige bar beholdes
+etter_close = datetime(2026, 9, 8, 17, 30, tzinfo=OSLO)
+beholdt = S.rens_prisdata({"KOG.OL": serie_til(date(2026, 9, 8))}, etter_close)
+krav("P0", "Dagens bar beholdes når sesjonen er avsluttet",
+     S._bar_dato(beholdt["KOG.OL"]) == date(2026, 9, 8)
+     and not S.datastatus(beholdt, etter_close)["stale"],
+     f"skanning 08.09 kl 17:30, etter stengetid 16:20 + 40 min margin "
+     f"→ beholder {S._bar_dato(beholdt['KOG.OL'])}")
+
+# Scores skal faktisk endre seg når siste dag kommer inn
+r_gammel = scan("KOG.OL", gammelt["KOG.OL"])
+r_fersk = scan("KOG.OL", ferskt["KOG.OL"])
+endret = [n for n, a, b in [
+    ("kurs", r_gammel["ind"]["close_now"], r_fersk["ind"]["close_now"]),
+    ("RSI14", r_gammel["ind"]["rsi"], r_fersk["ind"]["rsi"]),
+    ("SMA20", r_gammel["ind"]["sma20"], r_fersk["ind"]["sma20"]),
+    ("SMA50", r_gammel["ind"]["sma50"], r_fersk["ind"]["sma50"]),
+    ("ATR14", r_gammel["ind"]["atr"], r_fersk["ind"]["atr"]),
+    ("Vol Ratio", r_gammel["ind"]["volumeRatio20d"], r_fersk["ind"]["volumeRatio20d"]),
+    ("Correction Score", r_gammel["correctionScore"], r_fersk["correctionScore"]),
+    ("Trend Score", r_gammel["trendScore"], r_fersk["trendScore"]),
+] if a != b]
+krav("P0", "Manglende handelsdag påvirker mer enn KURS og % I DAG",
+     len(endret) >= 5 and "kurs" in endret and "RSI14" in endret,
+     f"én manglende candle endrer: {', '.join(endret)}\n    "
+     "derfor er STALE et blokkerende varsel, ikke en fotnote")
 
 
 # ── A: DNB vs NAS ──

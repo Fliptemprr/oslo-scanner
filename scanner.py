@@ -29,7 +29,7 @@ import logging
 import os
 import tempfile
 from dataclasses import dataclass, asdict
-from datetime import datetime, timedelta
+from datetime import date, datetime, time as dtime, timedelta
 from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Optional, Any
@@ -184,6 +184,19 @@ SCANNER_CONFIG: dict[str, Any] = {
 
     # ── Fundamental gate (manuell i v1) ──
     "fundamentals": {"resetOnNewCorrection": True},
+
+    # ── Markedsdata: hvilken handelsdag analysen skal bygge på ──
+    "data": {
+        "exchangeTimezone": "Europe/Oslo",
+        # Oslo Børs stenger 16:20. Marginen er hvor lenge etter stengetid vi
+        # godtar at dagens sluttdata ennå ikke har landet hos datakilden.
+        "marketCloseHour": 16,
+        "marketCloseMinute": 20,
+        "dataLagMinutes": 40,
+        # Forkast en uferdig candle. Skanner du midt i sesjonen er dagens bar
+        # halvferdig, og RSI, ATR og volumratio ville blitt regnet på den.
+        "dropIncompleteSession": True,
+    },
 
     # ── §32/§33: varsler ──
     "alerts": {
@@ -1866,6 +1879,152 @@ def evaluer_varsler(resultater: list, state: dict, cfg: dict = SCANNER_CONFIG) -
 
 
 # ══════════════════════════════════════════════════════════════
+# HANDELSKALENDER
+# Alle scores skal beregnes på siste AVSLUTTEDE handelsdag på Oslo Børs.
+# Ikke gårsdagen i kalenderen — helger og børshelligdager skal hoppes over.
+# ══════════════════════════════════════════════════════════════
+
+def paaskedag(aar: int) -> date:
+    """Første påskedag etter den gregorianske algoritmen."""
+    a = aar % 19
+    b, c = aar // 100, aar % 100
+    d, e = b // 4, b % 4
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i, k = c // 4, c % 4
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    maaned = (h + l - 7 * m + 114) // 31
+    dag = ((h + l - 7 * m + 114) % 31) + 1
+    return date(aar, maaned, dag)
+
+
+def bors_helligdager(aar: int) -> set:
+    """
+    Dager Euronext Oslo holder stengt.
+
+    De bevegelige er knyttet til påsken. Julaften og nyttårsaften er også
+    stengt, ikke bare halv dag.
+    """
+    p = paaskedag(aar)
+    return {
+        date(aar, 1, 1),                    # Nyttårsdag
+        p - timedelta(days=3),              # Skjærtorsdag
+        p - timedelta(days=2),              # Langfredag
+        p + timedelta(days=1),              # 2. påskedag
+        date(aar, 5, 1),                    # Arbeidernes dag
+        date(aar, 5, 17),                   # Grunnlovsdag
+        p + timedelta(days=39),             # Kristi himmelfartsdag
+        p + timedelta(days=50),             # 2. pinsedag
+        date(aar, 12, 24),                  # Julaften
+        date(aar, 12, 25),
+        date(aar, 12, 26),
+        date(aar, 12, 31),                  # Nyttårsaften
+    }
+
+
+def er_handelsdag(d: date) -> bool:
+    """Hverdag som ikke er børshelligdag."""
+    return d.weekday() < 5 and d not in bors_helligdager(d.year)
+
+
+def forrige_handelsdag(d: date) -> date:
+    d -= timedelta(days=1)
+    while not er_handelsdag(d):
+        d -= timedelta(days=1)
+    return d
+
+
+def siste_avsluttede_handelsdag(naa: Optional[datetime] = None,
+                                cfg: dict = SCANNER_CONFIG) -> date:
+    """
+    Hvilken handelsdag analysen skal bygge på akkurat nå.
+
+    Er dagens sesjon ferdig og sluttdataene rukket å lande, er det i dag.
+    Ellers er det forrige handelsdag — som etter en helg er fredag, og etter
+    en helligdag den siste virkedagen før den.
+    """
+    d_cfg = cfg["data"]
+    tz = ZoneInfo(d_cfg["exchangeTimezone"])
+    oslo = (naa or datetime.now(tz)).astimezone(tz)
+
+    stengt = dtime(d_cfg["marketCloseHour"], d_cfg["marketCloseMinute"])
+    frist = (datetime.combine(oslo.date(), stengt)
+             + timedelta(minutes=d_cfg["dataLagMinutes"])).time()
+
+    if er_handelsdag(oslo.date()) and oslo.time() >= frist:
+        return oslo.date()
+    return forrige_handelsdag(oslo.date())
+
+
+def _bar_dato(df: pd.DataFrame) -> Optional[date]:
+    """Datoen på siste bar i en kursserie."""
+    if df is None or len(df) == 0:
+        return None
+    return pd.Timestamp(df.index[-1]).date()
+
+
+def rens_prisdata(prisdata: dict, naa: Optional[datetime] = None,
+                  cfg: dict = SCANNER_CONFIG) -> dict:
+    """
+    Forkast en uferdig candle før noe beregnes.
+
+    Skanner du midt i sesjonen returnerer datakilden dagens halvferdige bar.
+    Den ville gått rett inn i RSI, ATR, volumratio og dermed alle scorene.
+    """
+    if not cfg["data"]["dropIncompleteSession"]:
+        return prisdata
+
+    forventet = siste_avsluttede_handelsdag(naa, cfg)
+    ut = {}
+    for t, df in prisdata.items():
+        d = _bar_dato(df)
+        if d is not None and d > forventet and len(df) > 1:
+            log.info(f"[{t}] forkaster uferdig bar {d} (siste avsluttede {forventet})")
+            df = df.iloc[:-1]
+        ut[t] = df
+    return ut
+
+
+def datastatus(prisdata: dict, naa: Optional[datetime] = None,
+               cfg: dict = SCANNER_CONFIG) -> dict:
+    """
+    Kontrollerer at dataene faktisk går til siste avsluttede handelsdag.
+
+    Mangler den, skal ikke analysen presenteres som oppdatert — den er da
+    regnet på foreldede kurser, og det gjelder ikke bare KURS og % I DAG,
+    men RSI, SMA-er, correction-data, fase og hele prioriteringen.
+    """
+    forventet = siste_avsluttede_handelsdag(naa, cfg)
+    per_ticker = {t: _bar_dato(df) for t, df in prisdata.items()}
+    gyldige = [d for d in per_ticker.values() if d is not None]
+    faktisk = max(gyldige) if gyldige else None
+    etterslep = {t: d for t, d in per_ticker.items() if d is not None and d < forventet}
+
+    return {
+        "forventet": forventet,
+        "faktisk": faktisk,
+        "stale": bool(faktisk is None or faktisk < forventet),
+        "etterslep": etterslep,
+        "perTicker": per_ticker,
+        "handelsdagerBak": _handelsdager_mellom(faktisk, forventet) if faktisk else None,
+    }
+
+
+def _handelsdager_mellom(fra: date, til: date) -> int:
+    """Antall handelsdager datagrunnlaget ligger bak."""
+    if fra >= til:
+        return 0
+    n, d = 0, fra
+    while d < til:
+        d += timedelta(days=1)
+        if er_handelsdag(d):
+            n += 1
+    return n
+
+
+# ══════════════════════════════════════════════════════════════
 # DATAHENTING – uendret mekanikk fra tidligere versjon
 # curl_cffi + threads=False er nødvendig mot Yahoo rate limit.
 # ══════════════════════════════════════════════════════════════
@@ -1932,18 +2091,25 @@ def _retry_missing(missing: list, session, start, end) -> dict:
 
 
 @st.cache_data(ttl=600, show_spinner=False)
-def hent_prisdata(tickers: tuple) -> dict:
+def hent_prisdata(tickers: tuple, handelsdag: Optional[date] = None) -> dict:
     """
     Last ned daglig OHLCV for watchlisten. Kun rådata caches – scoringen
     kjøres på nytt ved hver rerun, slik at fundamental-avkrysning slår
     gjennom umiddelbart uten ny nedlasting.
+
+    handelsdag inngår i cache-nøkkelen. Uten den kunne en container som lever
+    over et døgnskifte servere gårsdagens nedlasting videre.
     """
     liste = list(tickers)
     if not liste:
         return {}
 
-    start = datetime.now() - timedelta(days=HISTORY_DAYS)
-    end = datetime.now()
+    # end er eksklusiv hos yfinance, og Streamlit Cloud kjører i UTC. Med
+    # end = now falt siste avsluttede handelsdag utenfor vinduet i døgnskiftet.
+    # To dager fram fjerner tvetydigheten; dager som ikke finnes gir ingen data.
+    now = datetime.now()
+    start = now - timedelta(days=HISTORY_DAYS)
+    end = now + timedelta(days=2)
     session = _lag_session()
     alle: dict = {}
 
@@ -1970,7 +2136,12 @@ def hent_prisdata(tickers: tuple) -> dict:
 
 def kjor_scan(prisdata: dict, fund_store: dict, state: Optional[dict] = None,
               cfg: dict = SCANNER_CONFIG) -> list:
-    """Kjør motoren på alle nedlastede aksjer, med forrige tilstand som input."""
+    """
+    Kjør motoren på alle nedlastede aksjer, med forrige tilstand som input.
+
+    Uferdige candles er allerede forkastet av rens_prisdata(), så alt her
+    beregnes på siste avsluttede handelsdag.
+    """
     lagrede = (state or {}).get("corrections", {})
     ut = []
     for ticker, df in prisdata.items():
@@ -2305,6 +2476,40 @@ def event_detalj(r: dict) -> str:
     if g.get("abnormalVolume") and ind.get("volumeRatio20d") is not None:
         biter.append(f'VOL {f(ind["volumeRatio20d"], 1)}×')
     return " · ".join(biter)
+
+
+def datobanner(status: dict) -> str:
+    """
+    Hvilken handelsdag analysen faktisk bygger på. Vises alltid, slik at det
+    er mulig å verifisere datagrunnlaget uten å gjette.
+    """
+    forventet = status["forventet"].strftime("%d.%m.%Y")
+    faktisk = status["faktisk"].strftime("%d.%m.%Y") if status["faktisk"] else "—"
+
+    if not status["stale"]:
+        return (f'<div style="font-family:{MONO};font-size:10px;letter-spacing:0.1em;'
+                f'color:{DC["svak"]};padding:8px 0 0;">'
+                f'<span style="color:{DC["gronn"]};">●</span> MARKEDSDATA T.O.M. '
+                f'{faktisk}</div>')
+
+    bak = status["handelsdagerBak"]
+    mangler = ", ".join(sorted(t.replace(".OL", "") for t in status["etterslep"]))
+    return (
+        f'<div style="background:{_rgba(DC["orange"], 0.1)};'
+        f'border:1px solid {_rgba(DC["orange"], 0.45)};border-left:3px solid {DC["orange"]};'
+        f'border-radius:6px;padding:11px 14px;margin:8px 0;">'
+        f'<div style="font-family:{MONO};font-size:11px;letter-spacing:0.1em;'
+        f'color:{DC["orange"]};font-weight:600;">⚠ DATA STALE — SISTE DATA {faktisk}</div>'
+        f'<div style="font-size:12px;color:{DC["dempet"]};margin-top:5px;line-height:1.6;">'
+        f'Siste avsluttede handelsdag på Oslo Børs er <b style="color:{DC["tekst"]};">'
+        f'{forventet}</b>'
+        + (f', altså {bak} handelsdag{"er" if bak != 1 else ""} foran datagrunnlaget'
+           if bak else "")
+        + '. Analysen under er regnet på foreldede kurser — det gjelder ikke bare '
+        'KURS og % I DAG, men RSI, SMA-er, correction-data, fase og prioriteringen.'
+        + (f'<br>Mangler siste dag: <span style="font-family:{MONO};">{mangler}</span>'
+           if mangler else "")
+        + '</div></div>')
 
 
 def fremdriftsstripe(andel: float) -> str:
@@ -2992,10 +3197,17 @@ def _sidepanel(resultater: list) -> tuple:
     return sortering, vis_wait
 
 
-def _hoyrepanel(r: dict, fund_store: dict) -> bool:
+def _hoyrepanel(r: dict, fund_store: dict, dstatus: dict = None) -> bool:
     """Detaljpanelet. Returnerer True hvis fundamental-sjekken ble endret."""
     with st.container(key="panel"):
         st.html(panel_topp_html(r))
+        bak = (dstatus or {}).get("etterslep", {}).get(r["ticker"])
+        if bak:
+            st.html(f'<div style="background:{_rgba(DC["orange"], 0.1)};'
+                    f'border:1px solid {_rgba(DC["orange"], 0.4)};border-radius:6px;'
+                    f'padding:8px 11px;margin-top:10px;font-size:12px;'
+                    f'color:{DC["orange"]};">⚠ Siste data for {_esc(r["Ticker"])} er '
+                    f'{bak.strftime("%d.%m.%Y")} — tallene under er ikke oppdaterte.</div>')
 
         vindu = st.segmented_control("Vindu", list(GRAF_VINDUER.keys()),
                                      default="KORREKSJON", key=f"graf_{r['ticker']}",
@@ -3129,7 +3341,10 @@ def main() -> None:
         st.warning("Ingen aktive selskaper i watchlisten. Legg til i sidepanelet.")
         return
 
-    prisdata = hent_prisdata(tuple(sorted(aktive)))
+    forventet_dag = siste_avsluttede_handelsdag()
+    prisdata = hent_prisdata(tuple(sorted(aktive)), forventet_dag)
+    prisdata = rens_prisdata(prisdata)
+    dstatus = datastatus(prisdata)
     resultater = (kjor_scan(prisdata, st.session_state.fundamentals,
                             st.session_state.radar_state) if prisdata else [])
 
@@ -3164,11 +3379,12 @@ def main() -> None:
                   f'padding-top:9px;">RADAR · {len(resultater)}/{len(aktive)} SELSKAPER · '
                   f'{SCANNER_CONFIG["historyYears"]} ÅRS HISTORIKK</div>')
         c[1].html(f'<div style="font-family:{MONO};font-size:11px;color:{DC["svakest"]};'
-                  f'padding-top:9px;text-align:right;">OPPDATERT {oslo} OSLO</div>')
+                  f'padding-top:9px;text-align:right;">SKANNET {oslo} OSLO</div>')
         if c[2].button("SCAN NÅ", key="scan", width="stretch"):
             st.cache_data.clear()
             st.rerun()
 
+        st.html(datobanner(dstatus))
         st.html(statustellere(resultater))
         st.html(varselrader(st.session_state.nye_varsler))
 
@@ -3229,7 +3445,7 @@ def main() -> None:
         _fotnote()
 
     with panel:
-        if _hoyrepanel(valgt_r, st.session_state.fundamentals):
+        if _hoyrepanel(valgt_r, st.session_state.fundamentals, dstatus):
             st.rerun()
 
 
