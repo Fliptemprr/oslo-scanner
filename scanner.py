@@ -22,6 +22,7 @@ import numpy as np
 import altair as alt
 import yfinance as yf
 import html as html_lib
+import io
 import json
 import math
 import time
@@ -32,6 +33,7 @@ from dataclasses import dataclass, asdict
 from datetime import date, datetime, time as dtime, timedelta
 from zoneinfo import ZoneInfo
 from pathlib import Path
+from urllib import request as urlrequest
 from typing import Optional, Any
 
 # ──────────────────────────────────────────────────────────────
@@ -196,6 +198,15 @@ SCANNER_CONFIG: dict[str, Any] = {
         # Forkast en uferdig candle. Skanner du midt i sesjonen er dagens bar
         # halvferdig, og RSI, ATR og volumratio ville blitt regnet på den.
         "dropIncompleteSession": True,
+
+        # Andrekilde når Yahoo ikke leverer siste avsluttede handelsdag.
+        "stooqEnabled": True,
+        # Stooq leverer ujusterte kurser, Yahoo utbyttejusterte. Nye barer
+        # skaleres derfor til Yahoos nivå før de flettes inn. Avviker faktoren
+        # mer enn dette fra 1, er noe galt og vi fletter ikke.
+        "stooqMaxScaleDeviation": 0.20,
+        "stooqOverlapDays": 40,
+        "stooqTimeout": 20,
     },
 
     # ── §32/§33: varsler ──
@@ -2008,6 +2019,8 @@ def datastatus(prisdata: dict, naa: Optional[datetime] = None,
         "stale": bool(faktisk is None or faktisk < forventet),
         "etterslep": etterslep,
         "perTicker": per_ticker,
+        "kilder": {t: df.attrs.get("sisteKilde", "yahoo")
+                   for t, df in prisdata.items()},
         "handelsdagerBak": _handelsdager_mellom(faktisk, forventet) if faktisk else None,
     }
 
@@ -2066,6 +2079,141 @@ def _download_batch(batch: list, session, start, end) -> dict:
             else:
                 log.warning(f"Batch-feil ({type(e).__name__}): {e}")
     return result
+
+
+# ── Andrekilde: Stooq ─────────────────────────────────────────
+# Gratis CSV uten nøkkel. Brukes kun når Yahoo mangler siste
+# avsluttede handelsdag, aldri som primærkilde.
+
+STOOQ_URL = "https://stooq.com/q/d/l/?s={symbol}&i=d"
+
+
+def stooq_symbol(ticker: str) -> str:
+    """KOG.OL → kog.ol. Tickere uten suffiks antas amerikanske."""
+    t = ticker.strip().lower()
+    if "." in t:
+        return t
+    return f"{t}.us"
+
+
+def _hent_url(url: str, session, timeout: int) -> Optional[str]:
+    """Hent tekst med curl_cffi-sesjonen om den finnes, ellers urllib."""
+    try:
+        if session is not None:
+            svar = session.get(url, timeout=timeout)
+            if getattr(svar, "status_code", 200) != 200:
+                return None
+            return svar.text
+        with urlrequest.urlopen(url, timeout=timeout) as r:
+            return r.read().decode("utf-8", errors="replace")
+    except Exception as e:
+        log.debug(f"Henting av {url} feilet: {type(e).__name__}: {e}")
+        return None
+
+
+def parse_stooq_csv(tekst: str) -> Optional[pd.DataFrame]:
+    """
+    Tolk Stooq sin CSV. Returnerer None ved feilsvar, som ved rate limit
+    kommer som vanlig tekst og ikke som en HTTP-feil.
+    """
+    if not tekst or "Date,Open" not in tekst.split("\n")[0]:
+        return None
+    try:
+        df = pd.read_csv(io.StringIO(tekst))
+    except Exception as e:
+        log.debug(f"Stooq-CSV kunne ikke tolkes: {type(e).__name__}: {e}")
+        return None
+    if df.empty or "Close" not in df.columns:
+        return None
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    df = df.dropna(subset=["Date"]).set_index("Date").sort_index()
+    for kol in ("Open", "High", "Low", "Close", "Volume"):
+        if kol not in df.columns:
+            return None
+        df[kol] = pd.to_numeric(df[kol], errors="coerce")
+    return df[["Open", "High", "Low", "Close", "Volume"]].dropna(subset=["Close"])
+
+
+def hent_stooq(ticker: str, session=None, cfg: dict = SCANNER_CONFIG) -> Optional[pd.DataFrame]:
+    url = STOOQ_URL.format(symbol=stooq_symbol(ticker))
+    tekst = _hent_url(url, session, cfg["data"]["stooqTimeout"])
+    return parse_stooq_csv(tekst) if tekst else None
+
+
+def flett_inn_kilde(basis: pd.DataFrame, ny: pd.DataFrame,
+                    cfg: dict = SCANNER_CONFIG) -> tuple:
+    """
+    Flett nyere barer fra en annen kilde inn i en eksisterende serie.
+
+    Kildene bruker ulikt justeringsgrunnlag — Yahoo justerer for utbytte,
+    Stooq gjør det ikke. Limes de sammen rått, får siste bar et falskt hopp
+    som slår rett inn i % i dag, RSI, ATR og korreksjonens drawdown. Derfor
+    skaleres de nye barene til basisseriens nivå ved hjelp av forholdet på
+    siste felles dato.
+    """
+    d = cfg["data"]
+    if basis is None or basis.empty or ny is None or ny.empty:
+        return basis, None
+
+    felles = basis.index.intersection(ny.index)
+    if len(felles) == 0:
+        return basis, "ingen overlappende datoer"
+
+    ankerdato = felles[-1]
+    b = float(basis.loc[ankerdato, "Close"])
+    n = float(ny.loc[ankerdato, "Close"])
+    if not (math.isfinite(b) and math.isfinite(n)) or n <= 0:
+        return basis, "ugyldig ankerkurs"
+
+    faktor = b / n
+    if abs(faktor - 1.0) > d["stooqMaxScaleDeviation"]:
+        return basis, f"skaleringsfaktor {faktor:.3f} avviker for mye"
+
+    nye_rader = ny[ny.index > basis.index[-1]].copy()
+    if nye_rader.empty:
+        return basis, "ingen nyere barer"
+
+    for kol in ("Open", "High", "Low", "Close"):
+        nye_rader[kol] = nye_rader[kol] * faktor
+
+    slaatt = pd.concat([basis, nye_rader]).sort_index()
+    slaatt = slaatt[~slaatt.index.duplicated(keep="first")]
+    slaatt.attrs = dict(basis.attrs)
+    slaatt.attrs["sisteKilde"] = "stooq"
+    slaatt.attrs["skalering"] = round(faktor, 5)
+    return slaatt, None
+
+
+def topp_opp_fra_stooq(alle: dict, forventet: date, session,
+                       cfg: dict = SCANNER_CONFIG) -> tuple:
+    """Siste utvei når Yahoo ikke har siste avsluttede handelsdag."""
+    if not cfg["data"]["stooqEnabled"]:
+        return alle, []
+
+    mangler = [t for t, df in alle.items()
+               if _bar_dato(df) is not None and _bar_dato(df) < forventet]
+    if not mangler:
+        return alle, []
+
+    log.info(f"Prøver Stooq for {len(mangler)} tickere som mangler {forventet}")
+    fikset = []
+    for t in mangler:
+        try:
+            ny = hent_stooq(t, session, cfg)
+            if ny is None:
+                log.warning(f"[{t}] Stooq ga ikke brukbare data")
+                continue
+            slaatt, grunn = flett_inn_kilde(alle[t], ny, cfg)
+            if grunn:
+                log.warning(f"[{t}] Stooq ikke flettet inn: {grunn}")
+                continue
+            alle[t] = slaatt
+            fikset.append(t)
+            log.info(f"[{t}] Stooq toppet opp til {_bar_dato(slaatt)} "
+                     f"(skalering {slaatt.attrs.get('skalering')})")
+        except Exception as e:
+            log.warning(f"[{t}] Stooq feilet: {type(e).__name__}: {e}")
+    return alle, fikset
 
 
 def _hent_siste_dager(ticker: str, session, dager: int = 10) -> Optional[pd.DataFrame]:
@@ -2188,10 +2336,19 @@ def hent_prisdata(tickers: tuple, handelsdag: Optional[date] = None) -> dict:
     bak = [t for t, df in alle.items()
            if _bar_dato(df) is not None and _bar_dato(df) < forventet]
     if bak:
-        progress.progress(0.98, text=f"Henter siste handelsdag for {len(bak)}...")
+        progress.progress(0.97, text=f"Henter siste handelsdag for {len(bak)}...")
         alle, fikset = topp_opp_siste_dager(alle, forventet, session)
         if fikset:
             log.info(f"Toppet opp {len(fikset)} tickere til {forventet}")
+
+        # Fortsatt bak? Da leverer ikke Yahoo dagen i det hele tatt.
+        fortsatt = [t for t, df in alle.items()
+                    if _bar_dato(df) is not None and _bar_dato(df) < forventet]
+        if fortsatt:
+            progress.progress(0.99, text=f"Stooq for {len(fortsatt)}...")
+            alle, fra_stooq = topp_opp_fra_stooq(alle, forventet, session)
+            if fra_stooq:
+                log.info(f"Stooq dekket {len(fra_stooq)} tickere")
 
     progress.empty()
     log.info(f"Lastet ned {len(alle)}/{len(liste)} aksjer")
@@ -2551,10 +2708,13 @@ def datobanner(status: dict) -> str:
     faktisk = status["faktisk"].strftime("%d.%m.%Y") if status["faktisk"] else "—"
 
     if not status["stale"]:
+        kilder = status.get("kilder", {})
+        fra_stooq = sorted(t.replace(".OL", "") for t, k in kilder.items() if k == "stooq")
+        merke = (f' · SISTE DAG FRA STOOQ: {", ".join(fra_stooq)}' if fra_stooq else "")
         return (f'<div style="font-family:{MONO};font-size:10px;letter-spacing:0.1em;'
                 f'color:{DC["svak"]};padding:8px 0 0;">'
                 f'<span style="color:{DC["gronn"]};">●</span> MARKEDSDATA T.O.M. '
-                f'{faktisk}</div>')
+                f'{faktisk}{merke}</div>')
 
     bak = status["handelsdagerBak"]
     mangler = ", ".join(sorted(t.replace(".OL", "") for t in status["etterslep"]))

@@ -307,6 +307,84 @@ krav("P0", "Fallback kalles ikke når dataene allerede er ferske",
      ingen == [],
      "ingen ekstra Yahoo-forespørsler når siste handelsdag allerede er på plass")
 
+# ── Stooq som andrekilde ──
+def stooq_csv(df, faktor=1.0):
+    """Lag Stooq-lignende CSV fra en serie, eventuelt på et annet prisnivå."""
+    linjer = ["Date,Open,High,Low,Close,Volume"]
+    for ts, rad in df.iterrows():
+        linjer.append(
+            f"{ts.strftime('%Y-%m-%d')},{rad['Open'] * faktor:.4f},"
+            f"{rad['High'] * faktor:.4f},{rad['Low'] * faktor:.4f},"
+            f"{rad['Close'] * faktor:.4f},{int(rad['Volume'])}")
+    return "\n".join(linjer) + "\n"
+
+
+parset = S.parse_stooq_csv(stooq_csv(ferskt["KOG.OL"].tail(40)))
+krav("P0", "Stooq-CSV tolkes til riktig form",
+     parset is not None and list(parset.columns) == ["Open", "High", "Low", "Close", "Volume"]
+     and S._bar_dato(parset) == date(2026, 9, 7) and len(parset) == 40,
+     f"40 rader, siste bar {S._bar_dato(parset)}, kolonner {list(parset.columns)}")
+
+krav("P0", "Feilsvar fra Stooq gir None, ikke en ødelagt serie",
+     all(S.parse_stooq_csv(t) is None for t in [
+         "", "Exceeded the daily hits limit", "<html><body>404</body></html>",
+         "Date,Foo\n2026-09-07,1"]),
+     "tom tekst, rate limit-melding, HTML-feilside og feil kolonner avvises alle")
+
+krav("P0", "Stooq-symboler mappes riktig",
+     S.stooq_symbol("KOG.OL") == "kog.ol" and S.stooq_symbol("AAPL") == "aapl.us"
+     and S.stooq_symbol("EQNR.OL") == "eqnr.ol",
+     "KOG.OL → kog.ol · EQNR.OL → eqnr.ol · AAPL → aapl.us")
+
+# Skalering: Stooq på et annet prisnivå enn Yahoo (ujustert vs utbyttejustert)
+UJUSTERT = 1.08
+stooq_data = S.parse_stooq_csv(stooq_csv(ferskt["KOG.OL"].tail(40), UJUSTERT))
+basis = gammelt["KOG.OL"]
+flettet, grunn = S.flett_inn_kilde(basis, stooq_data)
+ny_bar = float(flettet["Close"].iloc[-1])
+fasit = float(ferskt["KOG.OL"]["Close"].iloc[-1])
+krav("P0", "Nye barer skaleres til basisseriens nivå før innfletting",
+     grunn is None and S._bar_dato(flettet) == date(2026, 9, 7)
+     and abs(ny_bar - fasit) < 0.01
+     and float(flettet["Close"].iloc[-2]) == float(basis["Close"].iloc[-1]),
+     f"Stooq lå {(UJUSTERT - 1) * 100:.0f} % over Yahoo-nivået\n    "
+     f"skaleringsfaktor {flettet.attrs['skalering']} → innflettet kurs "
+     f"{ny_bar:.2f} mot fasit {fasit:.2f}\n    "
+     f"uten skalering ville siste bar hoppet {(UJUSTERT - 1) * 100:.0f} % og "
+     f"forgiftet % i dag, RSI, ATR og drawdown")
+
+# For stort avvik skal avvises, ikke flettes
+feil_data = S.parse_stooq_csv(stooq_csv(ferskt["KOG.OL"].tail(40), 1.9))
+uendret, grunn2 = S.flett_inn_kilde(basis, feil_data)
+krav("P0", "Urimelig skaleringsfaktor avvises i stedet for å flettes inn",
+     grunn2 is not None and S._bar_dato(uendret) == S._bar_dato(basis),
+     f"faktor 1.9 → «{grunn2}», serien står urørt på {S._bar_dato(uendret)}")
+
+# Ingen overlapp = ingen felles anker = ingen fletting
+ingen_overlapp = S.parse_stooq_csv(stooq_csv(
+    serie_til(date(2020, 1, 10), n=30, seed=9)))
+_, grunn3 = S.flett_inn_kilde(basis, ingen_overlapp)
+krav("P0", "Uten overlappende datoer flettes ingenting inn",
+     grunn3 == "ingen overlappende datoer",
+     "skalering krever en felles dato å ankre mot, ellers er nivåene ukjente")
+
+# Hele kjeden: Yahoo mangler, Stooq redder
+_ekte_stooq = S.hent_stooq
+S.hent_stooq = lambda t, session=None, cfg=None: S.parse_stooq_csv(
+    stooq_csv(ferskt[t].tail(40), UJUSTERT))
+try:
+    kjede = {t: df.copy() for t, df in gammelt.items()}
+    kjede, fra_stooq = S.topp_opp_fra_stooq(kjede, date(2026, 9, 7), None)
+    st_kjede = S.datastatus(kjede, naa)
+finally:
+    S.hent_stooq = _ekte_stooq
+krav("P0", "Stooq dekker inn når Yahoo ikke leverer siste handelsdag",
+     not st_kjede["stale"] and set(fra_stooq) == {"KOG.OL", "KIT.OL"},
+     f"Yahoo t.o.m. 04.09 → Stooq toppet opp "
+     f"{sorted(t.replace('.OL','') for t in fra_stooq)} → "
+     f"siste data {st_kjede['faktisk']}, stale={st_kjede['stale']}")
+
+
 # Scores skal faktisk endre seg når siste dag kommer inn
 r_gammel = scan("KOG.OL", gammelt["KOG.OL"])
 r_fersk = scan("KOG.OL", ferskt["KOG.OL"])
