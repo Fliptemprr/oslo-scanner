@@ -2068,6 +2068,60 @@ def _download_batch(batch: list, session, start, end) -> dict:
     return result
 
 
+def _hent_siste_dager(ticker: str, session, dager: int = 10) -> Optional[pd.DataFrame]:
+    """
+    Hent kun de siste dagene med period i stedet for et datointervall.
+
+    Yahoo svarer på de to forespørslene fra hver sin cache, og den korte er
+    den som faktisk er fersk. Dette er derfor et reelt forsøk, ikke bare det
+    samme kallet på nytt.
+    """
+    raw = yf.download(ticker, period=f"{dager}d", interval="1d", progress=False,
+                      auto_adjust=True, timeout=20, threads=False, session=session)
+    if raw is None or raw.empty:
+        return None
+    if isinstance(raw.columns, pd.MultiIndex):
+        raw.columns = raw.columns.get_level_values(0)
+    return raw.dropna(how="all")
+
+
+def topp_opp_siste_dager(alle: dict, forventet: date, session,
+                         cfg: dict = SCANNER_CONFIG) -> tuple:
+    """
+    Hovednedlastingen kan komme tilbake uten siste avsluttede handelsdag.
+    Da hentes de siste dagene separat per ticker og flettes inn.
+
+    Bare barer som er NYERE enn det vi allerede har legges til. Eksisterende
+    rader røres ikke, slik at justeringsgrunnlaget i historikken holdes
+    uendret og ikke blandes med et nytt fra en kortere forespørsel.
+    """
+    mangler = [t for t, df in alle.items()
+               if _bar_dato(df) is not None and _bar_dato(df) < forventet]
+    if not mangler:
+        return alle, []
+
+    log.info(f"Mangler siste handelsdag ({forventet}) for {len(mangler)} tickere, "
+             f"henter siste dager separat")
+    fikset = []
+    for t in mangler:
+        try:
+            ny = _hent_siste_dager(t, session)
+            if ny is None or ny.empty:
+                continue
+            nye_rader = ny[ny.index > alle[t].index[-1]]
+            if nye_rader.empty:
+                continue
+            slaatt = pd.concat([alle[t], nye_rader]).sort_index()
+            slaatt = slaatt[~slaatt.index.duplicated(keep="first")]
+            alle[t] = slaatt
+            fikset.append(t)
+            log.info(f"[{t}] toppet opp til {_bar_dato(slaatt)}")
+            time.sleep(RETRY_DELAY_PER_TICKER)
+        except Exception as e:
+            log.warning(f"[{t}] topp-opp feilet: {type(e).__name__}: {e}")
+    return alle, fikset
+
+
 def _retry_missing(missing: list, session, start, end) -> dict:
     """Prøv manglende tickers én og én med pause mellom."""
     result = {}
@@ -2128,6 +2182,16 @@ def hent_prisdata(tickers: tuple, handelsdag: Optional[date] = None) -> dict:
         progress.progress(0.95, text=f"Retry {len(mangler)} manglende...")
         time.sleep(BATCH_DELAY)
         alle.update(_retry_missing(mangler, session, start, end))
+
+    # Mangler siste avsluttede handelsdag, prøv en kort period-forespørsel.
+    forventet = handelsdag or siste_avsluttede_handelsdag()
+    bak = [t for t, df in alle.items()
+           if _bar_dato(df) is not None and _bar_dato(df) < forventet]
+    if bak:
+        progress.progress(0.98, text=f"Henter siste handelsdag for {len(bak)}...")
+        alle, fikset = topp_opp_siste_dager(alle, forventet, session)
+        if fikset:
+            log.info(f"Toppet opp {len(fikset)} tickere til {forventet}")
 
     progress.empty()
     log.info(f"Lastet ned {len(alle)}/{len(liste)} aksjer")
@@ -2541,7 +2605,8 @@ def statustellere(resultater: list) -> str:
             f'<div style="font-family:{MONO};font-size:28px;font-weight:500;'
             f'line-height:1.15;color:{tallfarge};">{antall}</div></div>')
 
-    return (f'<div style="display:grid;grid-template-columns:repeat(7,minmax(0,1fr));'
+    return (f'<div style="display:grid;'
+            f'grid-template-columns:repeat(auto-fit,minmax(112px,1fr));'
             f'border-bottom:1px solid {DC["linje"]};">{"".join(celler)}</div>')
 
 

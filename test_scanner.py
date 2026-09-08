@@ -260,6 +260,53 @@ krav("P0", "Dagens bar beholdes når sesjonen er avsluttet",
      f"skanning 08.09 kl 17:30, etter stengetid 16:20 + 40 min margin "
      f"→ beholder {S._bar_dato(beholdt['KOG.OL'])}")
 
+# Fallback: kort period-forespørsel som fletter inn manglende dag
+class FalskSesjon:
+    """Simulerer at den korte forespørselen svarer med ferske data."""
+    def __init__(self, fasit): self.fasit = fasit
+
+
+_fasit = ferskt
+
+
+def _falsk_hent(ticker, session, dager=10):
+    return _fasit[ticker].tail(dager)
+
+
+_ekte_hent = S._hent_siste_dager
+S._hent_siste_dager = _falsk_hent
+try:
+    kopi = {t: df.copy() for t, df in gammelt.items()}
+    for_kurs = {t: float(df["Close"].iloc[-1]) for t, df in kopi.items()}
+    toppet, fikset = S.topp_opp_siste_dager(kopi, date(2026, 9, 7), None)
+    st_topp = S.datastatus(toppet, naa)
+    # Historikken skal være urørt: bare nye rader lagt til
+    urort = all(
+        toppet[t].iloc[:-1]["Close"].round(6).equals(gammelt[t]["Close"].round(6))
+        for t in toppet)
+finally:
+    S._hent_siste_dager = _ekte_hent
+
+krav("P0", "Fallback henter manglende handelsdag og fletter den inn",
+     not st_topp["stale"] and set(fikset) == {"KOG.OL", "KIT.OL"} and urort,
+     f"før: siste data {st_gammel['faktisk']}, stale={st_gammel['stale']}\n    "
+     f"etter fallback: siste data {st_topp['faktisk']}, stale={st_topp['stale']}, "
+     f"toppet opp {sorted(t.replace('.OL','') for t in fikset)}\n    "
+     f"eksisterende rader urørt: {urort} (kun nyere barer legges til, så "
+     f"justeringsgrunnlaget i historikken blandes ikke)")
+
+# Fallback skal ikke gjøre noe når dataene allerede er ferske
+S._hent_siste_dager = lambda *a, **k: (_ for _ in ()).throw(
+    AssertionError("skulle ikke kalles"))
+try:
+    _, ingen = S.topp_opp_siste_dager({t: df.copy() for t, df in ferskt.items()},
+                                      date(2026, 9, 7), None)
+finally:
+    S._hent_siste_dager = _ekte_hent
+krav("P0", "Fallback kalles ikke når dataene allerede er ferske",
+     ingen == [],
+     "ingen ekstra Yahoo-forespørsler når siste handelsdag allerede er på plass")
+
 # Scores skal faktisk endre seg når siste dag kommer inn
 r_gammel = scan("KOG.OL", gammelt["KOG.OL"])
 r_fersk = scan("KOG.OL", ferskt["KOG.OL"])
