@@ -368,7 +368,10 @@ krav("P0", "Uten overlappende datoer flettes ingenting inn",
      grunn3 == "ingen overlappende datoer",
      "skalering krever en felles dato å ankre mot, ellers er nivåene ukjente")
 
-# Hele kjeden: Yahoo mangler, Stooq redder
+# Hele kjeden: Yahoo mangler, Stooq redder. Flagget er av i produksjon
+# (stooq.com svarer med et JS-challenge), så testen slår det på eksplisitt.
+CFG_STOOQ = copy.deepcopy(S.SCANNER_CONFIG)
+CFG_STOOQ["data"]["stooqEnabled"] = True
 # Patcher på HTTP-nivå, slik at CSV-tolkning og skalering også testes
 _ekte_url = S._hent_url
 
@@ -383,7 +386,8 @@ S._hent_url = _falsk_url
 try:
     kjede = {t: df.copy() for t, df in gammelt.items()}
     diag = {}
-    kjede, fra_stooq = S.topp_opp_fra_stooq(kjede, date(2026, 9, 7), None, diag)
+    kjede, fra_stooq = S.topp_opp_fra_stooq(kjede, date(2026, 9, 7), None, diag,
+                                            CFG_STOOQ)
     st_kjede = S.datastatus(kjede, naa)
 finally:
     S._hent_url = _ekte_url
@@ -393,6 +397,163 @@ krav("P0", "Stooq dekker inn når Yahoo ikke leverer siste handelsdag",
      f"{sorted(t.replace('.OL','') for t in fra_stooq)} → "
      f"siste data {st_kjede['faktisk']}, stale={st_kjede['stale']}\n    "
      f"diagnose: {diag['KOG.OL']['stooq']}")
+
+
+# ── Yahoo-hull: dagen finnes hos kilden, men som null-bar ──
+# 07.09.2026 leverte Yahoo mandagen som null-bar for HELE Oslo Børs, ikke bare
+# watchlisten. yfinance sin dropna fjerner raden. Siden serien samtidig hadde
+# tirsdagens uferdige bar, så «siste bar < forventet»-sjekken en fersk serie,
+# og hele fallback-kjeden slo aldri til. Hullet lå BAK en nyere bar.
+
+def uten_dag(df, dag):
+    """Fjern én dag midt i serien — slik Yahoos null-bar faktisk arter seg."""
+    return df[df.index.date != dag]
+
+
+hull = uten_dag(serie_til(date(2026, 9, 8)), date(2026, 9, 7))
+komplett = serie_til(date(2026, 9, 7))
+krav("P0", "Hull bak en uferdig bar oppdages, ikke bare etterslep på slutten",
+     S.manglende_handelsdager(hull, date(2026, 9, 7)) == [date(2026, 9, 7)]
+     and S.manglende_handelsdager(komplett, date(2026, 9, 7)) == []
+     and S._bar_dato(hull) == date(2026, 9, 8),
+     f"serie t.o.m. {S._bar_dato(hull)} (uferdig tirsdagsbar) med mandag 07.09 borte\n    "
+     f"siste bar er nyere enn forventet dag, så etterslepssjekken ser ingenting\n    "
+     f"hullsjekken finner {S.manglende_handelsdager(hull, date(2026, 9, 7))}")
+
+# Aggregering av intradag til dagsbar. Feeden gir epoch i UTC mens børsen står
+# i Oslo-tid, og Streamlit Cloud kjører i UTC — konverteringen må være eksplisitt.
+def epoch(m, d, t, mi):
+    return int(datetime(2026, m, d, t, mi, tzinfo=OSLO).timestamp())
+
+
+ts_intra = [epoch(9, 7, 9, 0), epoch(9, 7, 12, 0), epoch(9, 7, 16, 15),
+            epoch(9, 8, 9, 0)]
+kvote_intra = {
+    "open":   [308.4, 305.0, 299.0, 298.1],
+    "high":   [309.5, 311.6, 300.0, 302.5],
+    "low":    [307.0, 299.5, 298.9, 295.8],
+    "close":  [309.0, 300.0, 298.9, 298.6],
+    "volume": [100, 200, 300, 400],
+}
+agg = S.aggreger_intradag(ts_intra, kvote_intra, "Europe/Oslo")
+man = agg.get(date(2026, 9, 7), {})
+krav("P0", "Intradag-barer aggregeres til korrekt dagsbar i børsens tidssone",
+     man.get("Open") == 308.4 and man.get("High") == 311.6
+     and man.get("Low") == 298.9 and man.get("Close") == 298.9
+     and man.get("Volume") == 600 and date(2026, 9, 8) in agg,
+     f"3 barer 07.09 → O {man.get('Open')} H {man.get('High')} "
+     f"L {man.get('Low')} C {man.get('Close')} V {man.get('Volume')}\n    "
+     f"open fra første bar, high/low som maks/min, close fra siste, volum summert")
+
+# Null-verdier finnes også i intradag-serien og skal hoppes over
+agg_hull = S.aggreger_intradag(
+    [epoch(9, 7, 9, 0), epoch(9, 7, 12, 0)],
+    {"open": [None, 305.0], "high": [None, 311.6], "low": [None, 299.5],
+     "close": [None, 300.0], "volume": [None, 200]}, "Europe/Oslo")
+krav("P0", "Null-barer i intradag-serien forkastes i stedet for å bli null",
+     agg_hull[date(2026, 9, 7)]["Open"] == 305.0
+     and agg_hull[date(2026, 9, 7)]["Volume"] == 200,
+     "en null-bar først i dagen ville ellers gitt Open=0 og forgiftet hele baren")
+
+# Sluttauksjonen 16:20-16:25 ligger ikke i den kontinuerlige intradag-feeden,
+# så aggregatet bommer litt på close. meta.chartPreviousClose har den
+# offisielle kursen, men er relativ til chartens REKKEVIDDE, ikke til siste
+# sesjon: fra range=1mo pekte den en måned tilbake og ga KIT 88.90 mot
+# riktige 98.40. Datoen må derfor utledes av svarets egen sesjon.
+svar_1d = {"timestamp": [epoch(9, 8, 9, 0)],
+           "meta": {"exchangeTimezoneName": "Europe/Oslo",
+                    "chartPreviousClose": 298.0}}
+krav("P0", "Offisiell sluttkurs bindes til sesjonen før svarets egen sesjon",
+     S.offisiell_close(svar_1d, date(2026, 9, 7), "Europe/Oslo") == 298.0
+     and S.offisiell_close(svar_1d, date(2026, 9, 4), "Europe/Oslo") is None
+     and S.offisiell_close(svar_1d, date(2026, 9, 8), "Europe/Oslo") is None
+     and S.offisiell_close(None, date(2026, 9, 7), "Europe/Oslo") is None,
+     "svaret gjelder sesjonen 08.09 → chartPreviousClose tilhører 07.09\n    "
+     "intradag-aggregatet ga KOG 298.90, offisiell close 298.00")
+
+# Innfletting midt i serien skal ikke røre eksisterende rader
+bar_inn = {"Open": 308.4, "High": 311.6, "Low": 298.9, "Close": 298.0,
+           "Volume": 609494}
+fylt = S.flett_inn_dagsbar(hull, date(2026, 9, 7), bar_inn)
+krav("P0", "Rekonstruert dagsbar settes inn på riktig plass, historikken urørt",
+     len(fylt) == len(hull) + 1
+     and float(fylt.loc[pd.Timestamp(date(2026, 9, 7)), "Close"]) == 298.0
+     and fylt.index.is_monotonic_increasing
+     and fylt.drop(index=pd.Timestamp(date(2026, 9, 7)))["Close"].round(6).equals(
+         hull["Close"].round(6)),
+     f"{len(hull)} → {len(fylt)} rader, mandagen inn mellom fredag og tirsdag, "
+     f"alle andre rader identiske")
+
+# Hele kjeden: Yahoo mangler dagen på dagsoppløsning, intradag redder den
+def falsk_intradag_svar(df, dager, tz="Europe/Oslo"):
+    """Yahoo chart-svar med intradag-barer som aggregerer til dagsbarene."""
+    ts, o, h, l, c, v = [], [], [], [], [], []
+    n = 12                                   # over backfillMinBars
+    for dag in dager:
+        rad = df.loc[pd.Timestamp(dag)]
+        for k in range(n):
+            # Siste bar bringer dagens high, low og close. De andre ligger på
+            # openkursen, slik at maks/min/siste gir nøyaktig dagsbaren igjen.
+            if k == n - 1:
+                aapne, hoy = rad["Open"], rad["High"]
+                lav, lukk = rad["Low"], rad["Close"]
+            else:
+                aapne = hoy = lav = lukk = rad["Open"]
+            ts.append(int(datetime(dag.year, dag.month, dag.day,
+                                   9 + (k * 7) // n, (k * 37) % 60,
+                                   tzinfo=OSLO).timestamp()))
+            o.append(float(aapne))
+            h.append(float(hoy))
+            l.append(float(lav))
+            c.append(float(lukk))
+            v.append(float(rad["Volume"]) / n)
+    return {"timestamp": ts,
+            "indicators": {"quote": [{"open": o, "high": h, "low": l,
+                                      "close": c, "volume": v}]},
+            "meta": {"exchangeTimezoneName": tz, "chartPreviousClose": None}}
+
+
+_fasit_hull = {"KOG.OL": serie_til(date(2026, 9, 8)),
+               "KIT.OL": serie_til(date(2026, 9, 8), seed=6)}
+# Offisiell close settes bevisst 0.3 % over intradag-aggregatets close, slik
+# at testen ser HVILKEN av de to som faktisk havner i serien.
+_OFFISIELL = {t: float(df.loc[pd.Timestamp(date(2026, 9, 7)), "Close"]) * 1.003
+              for t, df in _fasit_hull.items()}
+_ekte_intradag = S._hent_intradag
+_ekte_dagsmeta = S._hent_dagsmeta
+S._hent_intradag = lambda t, session, cfg=S.SCANNER_CONFIG: falsk_intradag_svar(
+    _fasit_hull[t], [date(2026, 9, 4), date(2026, 9, 7), date(2026, 9, 8)])
+S._hent_dagsmeta = lambda t, session, cfg=S.SCANNER_CONFIG: {
+    "timestamp": [epoch(9, 8, 9, 0)],
+    "meta": {"exchangeTimezoneName": "Europe/Oslo",
+             "chartPreviousClose": _OFFISIELL[t]}}
+try:
+    med_hull = {t: uten_dag(df, date(2026, 9, 7)) for t, df in _fasit_hull.items()}
+    diag_bf = {}
+    fylt_alle, bf_fikset = S.backfill_manglende_dager(
+        {t: df.copy() for t, df in med_hull.items()}, date(2026, 9, 7), None, diag_bf)
+    renset_bf = S.rens_prisdata(fylt_alle, i_sesjon)
+    st_bf = S.datastatus(renset_bf, i_sesjon)
+    st_uten = S.datastatus(S.rens_prisdata(med_hull, i_sesjon), i_sesjon)
+finally:
+    S._hent_intradag = _ekte_intradag
+    S._hent_dagsmeta = _ekte_dagsmeta
+
+brukt_close = {t: float(df.loc[pd.Timestamp(date(2026, 9, 7)), "Close"])
+               for t, df in fylt_alle.items()}
+krav("P0", "Intradag-backfill tetter hullet Yahoo etterlater på dagsoppløsning",
+     set(bf_fikset) == {"KOG.OL", "KIT.OL"} and not st_bf["stale"]
+     and st_uten["stale"] and st_uten["handelsdagerBak"] == 1
+     and all(S.manglende_handelsdager(df, date(2026, 9, 7)) == []
+             for df in fylt_alle.values())
+     and all(abs(brukt_close[t] - _OFFISIELL[t]) < 1e-6 for t in brukt_close),
+     f"uten backfill: siste data {st_uten['faktisk']}, stale={st_uten['stale']} "
+     f"(mandagen borte, tirsdagen forkastet som uferdig)\n    "
+     f"med backfill: siste data {st_bf['faktisk']}, stale={st_bf['stale']}, "
+     f"tettet {sorted(t.replace('.OL', '') for t in bf_fikset)}\n    "
+     f"kilde merket {renset_bf['KOG.OL'].attrs.get('sisteKilde')}\n    "
+     f"close hentet fra offisiell sluttkurs, ikke fra aggregatet: "
+     f"{brukt_close['KOG.OL']:.4f}")
 
 
 # Scores skal faktisk endre seg når siste dag kommer inn

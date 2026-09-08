@@ -27,7 +27,7 @@ egen historikk av korreksjoner, funnet med ATR-normalisert ZigZag. Et fall på
 | Fil | Innhold |
 |---|---|
 | `scanner.py` | Hele appen, ~3800 linjer. Config → typer → indikatorer → handelskalender → swings → scorer → motor → datahenting → UI |
-| `test_scanner.py` | 30 akseptansetester. Kjøres uten nett, med syntetiske kursserier |
+| `test_scanner.py` | 36 akseptansetester. Kjøres uten nett, med syntetiske kursserier |
 | `sjekk_data.py` | Frittstående diagnose av datakildene. Krever nett |
 | `.streamlit/config.toml` | Mørkt tema |
 | `README.md` | Kort produktbeskrivelse |
@@ -43,7 +43,7 @@ gitignorert. Streamlit Cloud har flyktig disk, så listen faller tilbake til
 1. **Ikke endre trading-logikken** — Correction Score, Trend Score, Recovery
    Score, phase, severity, statusmotoren, event risk — uten at brukeren
    eksplisitt gir nye regler. Masterspesifikasjonen styrer, ikke egne ideer.
-2. **`python test_scanner.py` skal være 30/30 før hver push.** Feiler noe,
+2. **`python test_scanner.py` skal være 36/36 før hver push.** Feiler noe,
    er det enten en reell regresjon eller en dårlig test. Begge må undersøkes,
    ingen av dem ignoreres.
 3. **`python -c "import ast; ast.parse(open('scanner.py').read())"` etter hver
@@ -57,68 +57,72 @@ gitignorert. Streamlit Cloud har flyktig disk, så listen faller tilbake til
 
 ---
 
-## 3. BLOKKERENDE PROBLEM (P0)
+## 3. P0 — LØST 08.09.2026
 
-**Datafeeden leverer ikke siste avsluttede handelsdag.**
+**Datafeeden leverte ikke siste avsluttede handelsdag.** Ved skanning tirsdag
+08.09 kl 13:15 viste radaren fortsatt fredagens data (04.09) for alle tickere.
 
-Ved skanning tirsdag 08.09.2026 kl 13:15 viste radaren fortsatt fredagens data
-(04.09). Siste avsluttede handelsdag var mandag 07.09. Det gjaldt **alle**
-tickere, ikke én.
+### Rotårsaken var to uavhengige feil
 
-Brukeren har bekreftet at mandagen finnes i markedet: KOG stengte 298,00
-(−3,37 %), KIT 98,40 (+2,07 %). Radaren viste KOG 308,40 — fredagens tall.
+**1. Yahoo leverte mandag 07.09 som null-bar.** Dagen finnes som tidsstempel i
+chart-APIet, men med `close=None`. `yfinance` sin `dropna` fjerner raden.
 
-Dette er blokkerende fordi det ikke bare gjelder KURS og % I DAG. Verifisert i
-test: én manglende candle endrer kurs, RSI14, SMA20, SMA50, ATR14, Vol Ratio
-og Correction Score. Altså hele signalmotoren.
-
-**Brukeren har stanset all videre testing av score- og statuslogikken til dette
-er løst. Ikke rør den logikken før datagrunnlaget er riktig.**
-
-### Hva som allerede er gjort og utelukket
-
-| Forsøk | Commit | Resultat |
-|---|---|---|
-| `end = datetime.now()` var eksklusiv og tvetydig i UTC-døgnskiftet. Endret til `now + 2 dager` | `372b228` | Løste det ikke |
-| Kort `period="10d"`-forespørsel som fallback når siste dag mangler | `688bbc4` | Løste det ikke |
-| Stooq som andrekilde, med skalering mot Yahoo-nivå | `312f148` | Ukjent — aldri verifisert mot ekte Stooq |
-| Diagnosepanel i UI + `TEST KILDER`-knapp | `005f033` | Venter på observasjon |
-| `sjekk_data.py` for lokal diagnose | `c961028` | **Ikke kjørt ennå** |
-
-### Hva som IKKE er utelukket
-
-- Om Stooq i det hele tatt svarer fra Streamlit Cloud (delte IP-er, rate limit)
-- Om Yahoo faktisk mangler dagen, eller om noe i koden forkaster den
-- Om `curl_cffi`-sesjonen fungerer mot Stooq
-
-### FØRSTE OPPGAVE
-
-```bash
-python sjekk_data.py
+```
+2026-09-04 09:00  close=308.3999938964844
+2026-09-07 09:00  close=None          ← mandag
+2026-09-08 09:00  close=298.5
 ```
 
-Skriptet skriver ut hvilken dato hver kilde faktisk leverer som siste bar, per
-ticker, for tre kilder: Yahoo med datointervall, Yahoo med `period`, og Stooq.
-Det krever ikke Streamlit.
+Det gjaldt hele Oslo Børs, også EQNR og TEL utenfor watchlisten. AAPL var
+upåvirket. På to år (500 barer) er dette den eneste null-dagen — altså et
+engangstilfelle, ikke et løpende mønster.
 
-Tolkning:
+**2. Hulldeteksjonen var blind for hull bak en nyere bar.** Fallback-kjeden
+spurte «er siste bar eldre enn forventet?». Midt i sesjonen lå tirsdagens
+uferdige bar sist i serien, så serien så fersk ut og hele kjeden ble hoppet
+over. `rens_prisdata` forkastet deretter tirsdagsbaren, helt korrekt, og da
+sto fredagen igjen. Selv en fungerende andrekilde ville aldri blitt kalt.
 
-- **Yahoo `period` har dagen, `intervall` ikke** → fallbacken i `hent_prisdata`
-  virker, men noe i produksjonskjeden hopper over den. Se `topp_opp_siste_dager`.
-- **Stooq har dagen, Yahoo ikke** → Stooq-kjeden er riktig, men noe feiler i
-  produksjon. Sjekk `_hent_url`, `parse_stooq_csv` og skaleringsgrensen
-  `data.stooqMaxScaleDeviation` (0.20).
-- **Ingen kilder har dagen** → problemet er ikke koden. Da må en annen kilde
-  velges. Brukeren har tilgang til alle Google-API-er; `GOOGLEFINANCE("OSL:KOG")`
-  via Sheets API er da det mest realistiske alternativet.
+### Løsningen
 
-Kjør deretter appen lokalt og se på den:
+Yahoo hadde mandagen hele tiden, bare ikke på dagsoppløsning. På 5-minutters
+intervall lå dagen komplett. Samme kilde, annet endepunkt — derfor ingen
+skalering, justeringsgrunnlaget er det samme.
 
-```bash
-streamlit run scanner.py
+- `manglende_handelsdager()` ser på hvilke handelsdager som faktisk finnes i
+  indeksen, i stedet for bare å se på siste bar
+- `backfill_manglende_dager()` rekonstruerer dagsbaren fra intradag-barene
+- Sluttauksjonen 16:20-16:25 ligger ikke i den kontinuerlige intradag-feeden,
+  så aggregatet ga KOG 298.90 mot offisielle 298.00. `meta.chartPreviousClose`
+  har den eksakte sluttkursen og overstyrer aggregatets close
+
+**Fallgruve, verifisert:** `chartPreviousClose` er relativ til chartens
+REKKEVIDDE, ikke til siste sesjon. Fra `range=1mo` pekte den en måned tilbake
+og ga KIT 88.90 mot riktige 98.40. Den må hentes fra en egen `range=1d`-
+forespørsel. Det er `_hent_dagsmeta()`.
+
+Verifisert mot brukerens bekreftede tall, null avvik:
+
+```
+TICKER        CLOSE   % I DAG       FASIT       %
+KOG.OL       298.00     -3.37       298.0   -3.37
+KIT.OL        98.40      2.07        98.4    2.07
 ```
 
----
+### Stooq er død kode
+
+`stooq.com` svarer HTTP 200 med en HTML-side, ikke CSV: et JavaScript
+proof-of-work-challenge (`crypto.subtle.digest` i løkke til hashen starter med
+fire nuller). Ingen ren HTTP-klient kommer forbi. Kjeden fra `312f148` har
+aldri virket. `stooqEnabled` er satt til `False`; koden og testene står igjen
+bak flagget i tilfelle det endrer seg.
+
+### Begrensning
+
+Yahoos 5-minutters historikk rekker bare rundt en måned tilbake. Backfillen
+tetter derfor ferske hull, styrt av `backfillMaxDays` (5). Eldre hull står
+igjen, og da blir STALE stående — som er riktig, for da er tallene faktisk
+ikke til å stole på.
 
 ## 4. Datahentingens arkitektur
 
@@ -126,15 +130,21 @@ Kjeden i `hent_prisdata()`:
 
 ```
 yf.download(start, end)  i batcher på 15, 5 s pause, curl_cffi, threads=False
-        ↓  mangler siste avsluttede handelsdag?
+        ↓  siste bar eldre enn forventet?
 yf.download(period="10d")  per ticker
         ↓  fortsatt?
-Stooq CSV  per ticker, skalert til Yahoo-nivå
+Stooq CSV  per ticker, skalert til Yahoo-nivå   ← av som standard, se §3
+        ↓  hull i serien, også bak en nyere bar?
+backfill_manglende_dager()   5m-barer aggregert til dagsbar,
+                             close fra range=1d chartPreviousClose
         ↓
 rens_prisdata()   forkaster uferdig candle hvis vi står midt i sesjonen
         ↓
 datastatus()      sammenligner mot siste_avsluttede_handelsdag()
 ```
+
+Merk rekkefølgen: hullsjekken kjører FØR `rens_prisdata`, mens den uferdige
+baren fortsatt ligger i serien. Derfor kan den ikke basere seg på siste bar.
 
 `threads=False` er påkrevd for curl_cffi — ikke fjern den.
 
@@ -181,7 +191,7 @@ To designvalg som er lette å ødelegge ved et uhell:
 ## 6. Åpne spørsmål som krever ekte data
 
 Disse har stått ubesvart hele veien fordi utviklingsmiljøet manglet nett.
-**Løs P0 først**, deretter disse:
+P0 er nå løst, så disse er neste steg. **Endre én verdi om gangen.**
 
 ### `maxCorrectionLookbackDays` (nå 400)
 
@@ -223,10 +233,15 @@ eller sett gulvet til `False`.
 git pull
 # endre scanner.py
 python -c "import ast; ast.parse(open('scanner.py').read())"
-python test_scanner.py          # skal være 30/30
+python test_scanner.py          # skal være 36/36
 streamlit run scanner.py        # se på den
 git add -A && git commit -m "..." && git push
 ```
+
+Lokalt oppsett på Windows: `.venv` med `pip install -r requirements.txt`.
+Testsuiten skriver ✓ og ✗, som cp1252-konsollen ikke kan vise — kjør derfor
+`set PYTHONIOENCODING=utf-8` først, ellers kræsjer den på utskriften og ikke
+på logikken.
 
 Commit-meldinger på norsk, som forklarer *hvorfor* endringen ble gjort og hva
 som ble funnet underveis. Se `git log` for tonen.

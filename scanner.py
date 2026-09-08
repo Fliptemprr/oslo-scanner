@@ -200,13 +200,31 @@ SCANNER_CONFIG: dict[str, Any] = {
         "dropIncompleteSession": True,
 
         # Andrekilde når Yahoo ikke leverer siste avsluttede handelsdag.
-        "stooqEnabled": True,
+        # 08.09.2026: stooq.com svarer med et JavaScript proof-of-work-
+        # challenge i stedet for CSV, så en ren HTTP-klient kommer aldri
+        # fram. Koden og testene beholdes bak flagget i tilfelle det endrer
+        # seg igjen, men kjeden kan ikke regnes som en reell andrekilde.
+        "stooqEnabled": False,
         # Stooq leverer ujusterte kurser, Yahoo utbyttejusterte. Nye barer
         # skaleres derfor til Yahoos nivå før de flettes inn. Avviker faktoren
         # mer enn dette fra 1, er noe galt og vi fletter ikke.
         "stooqMaxScaleDeviation": 0.20,
         "stooqOverlapDays": 40,
         "stooqTimeout": 20,
+
+        # Yahoo kan levere en handelsdag som null-bar på dagsoppløsning selv
+        # om intradag-serien har dagen. 07.09.2026 gjaldt det hele Oslo Børs.
+        # Da rekonstrueres dagsbaren fra intradag-barene.
+        "backfillEnabled": True,
+        "backfillInterval": "5m",
+        "backfillRange": "1mo",
+        # Hvor mange handelsdager bakover det tettes. 5m-historikken hos
+        # Yahoo rekker uansett bare rundt en måned.
+        "backfillMaxDays": 5,
+        # Færre barer enn dette er en halv sesjon, og da blir high og low
+        # feil. Da er det ærligere å la dagen stå tom og beholde STALE.
+        "backfillMinBars": 10,
+        "backfillTimeout": 20,
     },
 
     # ── §32/§33: varsler ──
@@ -1976,6 +1994,32 @@ def _bar_dato(df: pd.DataFrame) -> Optional[date]:
     return pd.Timestamp(df.index[-1]).date()
 
 
+def manglende_handelsdager(df: pd.DataFrame, forventet: date,
+                           maks: int = 5) -> list:
+    """
+    Handelsdager som mangler i serien, fram til og med forventet dag.
+
+    Etterslepssjekken ellers i koden spør «er siste bar eldre enn
+    forventet?». Den er blind for et hull som ligger BAK en nyere bar, og
+    det er nettopp slik feilen 07.09.2026 artet seg: mandagen borte fra
+    Yahoo, tirsdagens uferdige bar på plass. Serien så fersk ut, og hele
+    fallback-kjeden ble hoppet over. Her ses det derfor på hvilke
+    handelsdager som faktisk finnes i indeksen.
+    """
+    if df is None or len(df) == 0:
+        return []
+    har = {pd.Timestamp(t).date() for t in df.index}
+    forste = min(har)
+    ut, d = [], forventet
+    for _ in range(maks):
+        if d <= forste:
+            break
+        if d not in har and er_handelsdag(d):
+            ut.append(d)
+        d = forrige_handelsdag(d)
+    return sorted(ut)
+
+
 def rens_prisdata(prisdata: dict, naa: Optional[datetime] = None,
                   cfg: dict = SCANNER_CONFIG) -> dict:
     """
@@ -2230,6 +2274,201 @@ def topp_opp_fra_stooq(alle: dict, forventet: date, session,
     return alle, fikset
 
 
+# ══════════════════════════════════════════════════════════════
+# INTRADAG-BACKFILL
+# Yahoo leverte 07.09.2026 mandagen som null-bar på dagsoppløsning
+# for hele Oslo Børs, mens 5-minuttersserien hadde dagen. Samme
+# kilde, annet endepunkt — derfor ingen skalering: justeringsnivået
+# er det samme.
+# ══════════════════════════════════════════════════════════════
+
+YAHOO_CHART_URL = ("https://query1.finance.yahoo.com/v8/finance/chart/"
+                   "{ticker}?range={rekkevidde}&interval={intervall}")
+
+
+def _hent_chart(ticker: str, session, rekkevidde: str, intervall: str,
+                cfg: dict = SCANNER_CONFIG) -> Optional[dict]:
+    """Rått svar fra Yahoos chart-API."""
+    url = YAHOO_CHART_URL.format(ticker=ticker, rekkevidde=rekkevidde,
+                                 intervall=intervall)
+    tekst = _hent_url(url, session, cfg["data"]["backfillTimeout"])
+    if not tekst:
+        return None
+    try:
+        res = json.loads(tekst)["chart"]["result"][0]
+    except Exception as e:
+        log.debug(f"[{ticker}] chart-svar ({rekkevidde}/{intervall}) kunne ikke "
+                  f"tolkes: {type(e).__name__}: {e}")
+        return None
+    return res if res.get("timestamp") else None
+
+
+def _hent_intradag(ticker: str, session, cfg: dict = SCANNER_CONFIG) -> Optional[dict]:
+    """Intradag-serien som dagsbarene rekonstrueres fra."""
+    d = cfg["data"]
+    return _hent_chart(ticker, session, d["backfillRange"],
+                       d["backfillInterval"], cfg)
+
+
+def _hent_dagsmeta(ticker: str, session, cfg: dict = SCANNER_CONFIG) -> Optional[dict]:
+    """
+    Egen range=1d-forespørsel, kun for den offisielle sluttkursen.
+
+    chartPreviousClose er relativ til chartens REKKEVIDDE, ikke til siste
+    sesjon. Fra intradag-svaret (range=1mo) pekte den en måned tilbake og ga
+    KIT 88.90 mot riktige 98.40. Kun range=1d gir «sesjonen før dagens».
+    """
+    return _hent_chart(ticker, session, "1d", "1d", cfg)
+
+
+def aggreger_intradag(tidsstempler: list, kvote: dict, tz: str) -> dict:
+    """
+    Slå intradag-barer sammen til dagsbarer, gruppert på børsens lokale dato.
+
+    Tidsstemplene er epoch i UTC mens dagen defineres av børsens tidssone.
+    Streamlit Cloud kjører i UTC, så konverteringen må være eksplisitt —
+    ellers havner morgenbarene på feil dato.
+    """
+    sone, utc = ZoneInfo(tz), ZoneInfo("UTC")
+    o, h = kvote.get("open") or [], kvote.get("high") or []
+    l, c = kvote.get("low") or [], kvote.get("close") or []
+    v = kvote.get("volume") or []
+    ut: dict = {}
+
+    for i, stempel in enumerate(tidsstempler or []):
+        felt = [(_num(kol[i]) if i < len(kol) else None) for kol in (o, h, l, c)]
+        if any(x is None for x in felt):
+            continue                    # Yahoo har null-barer også intradag
+        aapne, hoy, lav, lukk = felt
+        vol = _num(v[i]) if i < len(v) else None
+        dag = datetime.fromtimestamp(stempel, tz=utc).astimezone(sone).date()
+
+        rad = ut.get(dag)
+        if rad is None:
+            ut[dag] = {"Open": aapne, "High": hoy, "Low": lav, "Close": lukk,
+                       "Volume": vol or 0.0, "_barer": 1}
+        else:
+            rad["High"] = max(rad["High"], hoy)
+            rad["Low"] = min(rad["Low"], lav)
+            rad["Close"] = lukk
+            rad["Volume"] += vol or 0.0
+            rad["_barer"] += 1
+    return ut
+
+
+def offisiell_close(res: Optional[dict], dag: date,
+                    tz_standard: str) -> Optional[float]:
+    """
+    Offisiell sluttkurs for `dag` fra et range=1d chart-svar, ellers None.
+
+    Sluttauksjonen 16:20-16:25 ligger ikke i den kontinuerlige intradag-feeden,
+    så et rent aggregat bommer litt: KOG ga 298.90 mot offisielle 298.00 den
+    07.09.2026 — 0.30 % rett inn i % i dag, RSI og drawdown.
+
+    chartPreviousClose tilhører sesjonen FØR den svaret selv gjelder, og
+    dekker derfor nøyaktig én dag. Den datoen utledes her i stedet for å antas.
+    """
+    if not res:
+        return None
+    meta = res.get("meta") or {}
+    kurs = _num(meta.get("chartPreviousClose"))
+    stempler = res.get("timestamp") or []
+    if kurs is None or not stempler:
+        return None
+    tz = meta.get("exchangeTimezoneName") or tz_standard
+    sesjon = (datetime.fromtimestamp(stempler[0], tz=ZoneInfo("UTC"))
+              .astimezone(ZoneInfo(tz)).date())
+    return kurs if forrige_handelsdag(sesjon) == dag else None
+
+
+def flett_inn_dagsbar(df: pd.DataFrame, dag: date, bar: dict) -> pd.DataFrame:
+    """
+    Sett en rekonstruert dagsbar inn i serien uten å røre eksisterende rader.
+
+    Baren havner på sin egen dato i en sortert indeks, slik at RSI, SMA-er og
+    ATR ser dagene i riktig rekkefølge.
+    """
+    if df is None or len(df) == 0:
+        return df
+    stempel = pd.Timestamp(dag)
+    if stempel in df.index:
+        return df
+    ny = pd.DataFrame([{k: bar.get(k) for k in df.columns}], index=[stempel])
+    ut = pd.concat([df, ny]).sort_index()
+    ut.attrs = dict(df.attrs)
+    return ut
+
+
+def backfill_manglende_dager(alle: dict, forventet: date, session,
+                             diag: Optional[dict] = None,
+                             cfg: dict = SCANNER_CONFIG) -> tuple:
+    """
+    Tett hull i dagsserien med barer rekonstruert fra intradag.
+
+    Uten dette forsvinner dagen ikke bare fra KURS og % I DAG, men fra RSI,
+    SMA-ene, ATR og volumratio — altså fra hele signalmotoren.
+
+    5-minutters historikk hos Yahoo rekker bare rundt en måned tilbake, så
+    dette tetter ferske hull. Eldre hull står igjen, og da blir STALE stående,
+    som er riktig: da er tallene faktisk ikke til å stole på.
+    """
+    d = cfg["data"]
+    if not d["backfillEnabled"]:
+        return alle, []
+
+    trengs = {t: manglende_handelsdager(df, forventet, d["backfillMaxDays"])
+              for t, df in alle.items()}
+    trengs = {t: dager for t, dager in trengs.items() if dager}
+    if not trengs:
+        return alle, []
+
+    log.info(f"Hull i dagsserien for {len(trengs)} tickere, "
+             f"rekonstruerer fra intradag")
+    fikset = []
+    for t, dager in trengs.items():
+        dd = diag.setdefault(t, {}) if diag is not None else {}
+        try:
+            res = _hent_intradag(t, session, cfg)
+            if not res:
+                dd["intradag"] = "ingen respons"
+                log.warning(f"[{t}] intradag: ingen respons")
+                continue
+
+            meta = res.get("meta") or {}
+            tz = meta.get("exchangeTimezoneName") or d["exchangeTimezone"]
+            kvote = (res.get("indicators", {}).get("quote") or [{}])[0]
+            per_dag = aggreger_intradag(res.get("timestamp"), kvote, tz)
+            tilgjengelig = sorted(per_dag)
+            dagsmeta = _hent_dagsmeta(t, session, cfg)
+
+            lagt_inn = []
+            for dag in dager:
+                bar = per_dag.get(dag)
+                if bar is None:
+                    continue
+                if bar["_barer"] < d["backfillMinBars"]:
+                    log.warning(f"[{t}] {dag}: kun {bar['_barer']} intradag-barer, "
+                                f"hopper over")
+                    continue
+                off = offisiell_close(dagsmeta, dag, tz)
+                if off is not None:
+                    bar = dict(bar, Close=off)
+                alle[t] = flett_inn_dagsbar(alle[t], dag, bar)
+                alle[t].attrs["sisteKilde"] = "yahoo-intradag"
+                lagt_inn.append(f"{dag}{' (offisiell close)' if off else ''}")
+
+            dd["intradag"] = (f"tettet {', '.join(lagt_inn)}" if lagt_inn
+                              else f"manglet {dager}, intradag hadde "
+                                   f"{tilgjengelig[-3:] if tilgjengelig else 'ingenting'}")
+            if lagt_inn:
+                fikset.append(t)
+                log.info(f"[{t}] tettet {', '.join(lagt_inn)} fra intradag")
+        except Exception as e:
+            dd["intradag"] = f"feil: {type(e).__name__}: {e}"[:120]
+            log.warning(f"[{t}] intradag-backfill feilet: {type(e).__name__}: {e}")
+    return alle, fikset
+
+
 def _hent_siste_dager(ticker: str, session, dager: int = 10) -> Optional[pd.DataFrame]:
     """
     Hent kun de siste dagene med period i stedet for et datointervall.
@@ -2374,12 +2613,21 @@ def hent_prisdata(tickers: tuple, handelsdag: Optional[date] = None) -> tuple:
             if fra_stooq:
                 log.info(f"Stooq dekket {len(fra_stooq)} tickere")
 
+    # Serien kan se fersk ut og likevel ha hull: Yahoo leverer dager som
+    # null-barer, og ligger det en uferdig bar etter hullet, fanger ikke
+    # etterslepssjekken over det opp. Derfor sjekkes hull for seg.
+    progress.progress(0.99, text="Sjekker hull i serien...")
+    alle, tettet = backfill_manglende_dager(alle, forventet, session, diag)
+    if tettet:
+        log.info(f"Tettet hull fra intradag for {len(tettet)} tickere")
+
     for t in liste:
         d = diag.setdefault(t, {})
         d["endelig"] = str(_bar_dato(alle[t])) if t in alle else "ingen data"
         d.setdefault("yahooBatch", "ingen data")
         d.setdefault("yahooPeriod", "ikke forsøkt")
         d.setdefault("stooq", "ikke forsøkt")
+        d.setdefault("intradag", "ingen hull")
 
     progress.empty()
     log.info(f"Lastet ned {len(alle)}/{len(liste)} aksjer")
@@ -3545,6 +3793,7 @@ def _kildediagnose(diag: dict, dstatus: dict) -> None:
             "Yahoo batch": d.get("yahooBatch", "—"),
             "Yahoo period": d.get("yahooPeriod", "—"),
             "Stooq": d.get("stooq", "—"),
+            "Intradag": d.get("intradag", "—"),
             "Brukt": d.get("endelig", "—"),
         })
     if not rader:
@@ -3555,7 +3804,9 @@ def _kildediagnose(diag: dict, dstatus: dict) -> None:
             f"Forventet siste avsluttede handelsdag: {dstatus['forventet']} · "
             f"HTTP-klient: {diag.get('_sesjon', '?')}. "
             "«Yahoo batch» er den lange datointervall-forespørselen, "
-            "«Yahoo period» den korte, «Stooq» andrekilden."
+            "«Yahoo period» den korte, «Stooq» andrekilden (av som "
+            "standard), «Intradag» rekonstruksjon av dager Yahoo leverte "
+            "som null-barer."
         )
         st.dataframe(pd.DataFrame(rader), width="stretch", hide_index=True,
                      height=min(len(rader) * 36 + 40, 400))
