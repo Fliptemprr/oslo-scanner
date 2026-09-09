@@ -823,6 +823,222 @@ krav("P0", "Ujustert fisjon blåser opp topp og Trend, justering gir basis tilba
      f"trend {r_basis['trendScore']:.0f}  (justeringen inverterer forurensningen)")
 
 
+# ══════════════════════════════════════════════════════════════
+# TIDLIG LAG – BOTTOM WATCH og LYTTEPOST
+# ══════════════════════════════════════════════════════════════
+
+def lag_features(**over):
+    """Nøytralt utgangspunkt der ingen kriterier er truffet. Turn Score = 0."""
+    f = {
+        "kurs": 100.0, "localLow20d": 100.0, "localLow10d": 100.0,
+        "distanceFromLowPct": 0.0,
+        "return3d": 0.0, "return5d": -1.0, "return3dForrige": 0.0,
+        "rsi": 50.0, "rsiChange3d": 0.0, "rsiChangeForrige3d": 0.0,
+        "volumeRatio20d": 1.0, "upVolumeRatio": None,
+        "volOpp": None, "volNed": None, "positivDagMedVolum": False,
+        "negSnitt3d": 1.0, "negSnittForrige3d": 1.0,
+        "nyttLow20dIDag": False, "nyLow20dSiste3": True,
+        "ingenNyLow10dSiste3": False,
+        "testetBunnsone": False, "overBunnsone": False, "testerSoneIDag": False,
+        "loeftFraDagensLow": 0.0,
+        "positiveSiste3": 0, "dagensDagErNegativ": False,
+        "higherLow": False, "sma20Reclaim": False, "bryterMotstand": False,
+        "momentumSnudd": False,
+    }
+    f.update(over)
+    return f
+
+
+class FalskKorreksjon:
+    def __init__(self, drawdown):
+        self.currentDrawdownPct = drawdown
+
+
+IND_STUB = {"lastDate": pd.Timestamp("2026-09-08")}
+
+
+def tidlig_med(features, lagret=None, cc=None, cfg=None):
+    """Kjør vurder_tidlig_lag mot en konstruert featuredict."""
+    ekte = S.tidlige_features
+    S.tidlige_features = lambda ind, c=None: features
+    try:
+        return S.vurder_tidlig_lag(IND_STUB, cc, lagret, cfg or S.SCANNER_CONFIG)
+    finally:
+        S.tidlige_features = ekte
+
+
+E = S.SCANNER_CONFIG["early"]
+
+# ── §3: poengtabellen skal summere til 100, fordelt som spesifisert ──
+gruppesum = {g: sum(E["poeng"][n] for n in nokler)
+             for g, nokler in E["grupper"].items()}
+krav("§T1", "Turn Score-gruppene summerer til 20/20/20/15/15/10 = 100",
+     gruppesum == {"A": 20, "B": 20, "C": 20, "D": 15, "E": 15, "F": 10}
+     and sum(gruppesum.values()) == 100,
+     f"A {gruppesum['A']} · B {gruppesum['B']} · C {gruppesum['C']} · "
+     f"D {gruppesum['D']} · E {gruppesum['E']} · F {gruppesum['F']} "
+     f"= {sum(gruppesum.values())}")
+
+# ── §2: Falling Knife Guard ──
+kniv2, grunner2 = S.falling_knife_guard(
+    lag_features(nyttLow20dIDag=True, return3d=-8.0))
+kniv1, grunner1 = S.falling_knife_guard(lag_features(nyttLow20dIDag=True))
+kniv_vol, _ = S.falling_knife_guard(
+    lag_features(dagensDagErNegativ=True, volumeRatio20d=1.8, rsiChange3d=-6.0))
+krav("§T2", "Falling Knife Guard krever minst to av fire tegn",
+     kniv2 and len(grunner2) == 2 and not kniv1 and len(grunner1) == 1 and kniv_vol,
+     f"nytt 20D-low + 3D {-8.0} % → {grunner2} → sperret\n    "
+     f"kun nytt 20D-low → {grunner1} → ikke sperret\n    "
+     f"negativ dag på volumratio 1.8 + RSI ned 6 poeng → sperret\n    "
+     f"en stor korreksjon alene skal aldri gi signal")
+
+# En aksje i fritt fall skal ikke engang få BOTTOM WATCH
+fritt_fall = lag_features(nyttLow20dIDag=True, return3d=-9.0,
+                          ingenNyLow10dSiste3=True, testetBunnsone=True,
+                          overBunnsone=True, higherLow=True, sma20Reclaim=True,
+                          upVolumeRatio=1.5)
+res_fall = tidlig_med(fritt_fall)
+krav("§T3", "Falling knife sperrer hele laget, ikke bare LYTTEPOST",
+     res_fall["status"] is None and res_fall["fallingKnife"]
+     and res_fall["turnScore"] >= E["bottomWatch"],
+     f"Turn Score {res_fall['turnScore']} er over BOTTOM WATCH-terskelen "
+     f"{E['bottomWatch']}, men guarden er aktiv ({res_fall['knivGrunner']})\n    "
+     f"→ status {res_fall['status']}, altså ingen oppgradering fra WAIT")
+
+# ── §4: Entry Value ──
+band = [(2.0, 100), (4.0, 90), (6.0, 80), (10.0, 65),
+        (14.0, 50), (18.0, 35), (25.0, 20)]
+feil_band = [(d, S.entry_value(lag_features(distanceFromLowPct=d), None), v)
+             for d, v in band
+             if S.entry_value(lag_features(distanceFromLowPct=d), None) != v]
+med_bonus = S.entry_value(lag_features(distanceFromLowPct=10.0),
+                          FalskKorreksjon(20.0))
+uten_bonus = S.entry_value(lag_features(distanceFromLowPct=10.0),
+                           FalskKorreksjon(9.0))
+tak = S.entry_value(lag_features(distanceFromLowPct=1.0), FalskKorreksjon(30.0))
+krav("§T4", "Entry Value følger båndene, med drawdown-bonus og tak på 100",
+     not feil_band and med_bonus == 75 and uten_bonus == 65 and tak == 100,
+     f"0-3 % fra bunn → 100 · 8-12 % → 65 · over 20 % → 20\n    "
+     f"10 % fra bunn med 20 % drawdown → {med_bonus} (65 + 10 bonus)\n    "
+     f"samme, men 9 % drawdown → {uten_bonus} (ingen bonus)\n    "
+     f"1 % fra bunn med 30 % drawdown → {tak}, kappet på 100")
+
+# ── §5: LYTTEPOST krever alle fire vilkår samtidig ──
+sterk = lag_features(
+    distanceFromLowPct=2.0,
+    ingenNyLow10dSiste3=True, return3d=3.0, return3dForrige=-5.0,
+    testetBunnsone=True, overBunnsone=True, nyLow20dSiste3=False,
+    return5d=1.0, higherLow=True, sma20Reclaim=True)
+res_sterk = tidlig_med(sterk)
+krav("§T5", "LYTTEPOST aktiveres når Turn, Entry, guard og gruppekrav er oppfylt",
+     res_sterk["status"] == S.STATUS_LYTTEPOST
+     and res_sterk["turnScore"] >= E["lyttepost"]
+     and res_sterk["entryValue"] >= E["entryMin"]
+     and res_sterk["positiveGrupper"] >= E["minGrupper"]
+     and res_sterk["styrke"] == "EARLY",
+     f"Turn {res_sterk['turnScore']} · Entry {res_sterk['entryValue']} · "
+     f"{res_sterk['positiveGrupper']} positive grupper → "
+     f"{res_sterk['status']} – {res_sterk['styrke']}\n    "
+     f"gruppepoeng {res_sterk['grupper']}")
+
+# Samme tekniske bilde, men langt fra bunnen: ingen LYTTEPOST
+langt_fra = dict(sterk, distanceFromLowPct=25.0)
+res_langt = tidlig_med(langt_fra)
+krav("§T6", "Sterk vending langt fra bunnen gir BOTTOM WATCH, ikke LYTTEPOST",
+     res_langt["status"] == S.STATUS_BOTTOM_WATCH
+     and res_langt["turnScore"] == res_sterk["turnScore"]
+     and res_langt["entryValue"] < E["entryMin"],
+     f"samme Turn Score {res_langt['turnScore']}, men Entry "
+     f"{res_langt['entryValue']} < {E['entryMin']}\n    "
+     f"det er nettopp dette som gjør at KIT 87.60 kan slå KIT 95.40")
+
+# ── §6/§10: styrke og Opportunity Score ──
+opp_tidlig = S.opportunity_score(65, 90)
+opp_bekreftet = S.opportunity_score(90, 40)
+krav("§T7", "Opportunity Score lar den tidlige muligheten slå den utstrakte",
+     opp_tidlig == 75.0 and opp_bekreftet == 70.0 and opp_tidlig > opp_bekreftet
+     and S.lyttepost_styrke(60) == "EARLY" and S.lyttepost_styrke(69) == "GOOD"
+     and S.lyttepost_styrke(80) == "STRONG",
+     f"Turn 65 / Entry 90 → {opp_tidlig}   ·   Turn 90 / Entry 40 → "
+     f"{opp_bekreftet}\n    "
+     f"styrkebånd: 60 → EARLY · 69 → GOOD · 80 → STRONG")
+
+# ── §7: signal decay med hysterese ──
+signal = {"signalDato": "2026-09-01", "signalKurs": 100.0,
+          "signalLocalLow": 95.0, "signalTurnScore": 60.0}
+svakere = dict(sterk, sma20Reclaim=False)                    # Turn 50
+mye_svakere = dict(sterk, sma20Reclaim=False, higherLow=False)   # Turn 43
+res_50 = tidlig_med(svakere, lagret=signal)
+res_43 = tidlig_med(mye_svakere, lagret=signal)
+krav("§T8", "Aktivt signal beholdes ned til decay-terskelen, så svekkes det",
+     res_50["turnScore"] == 50 and res_50["status"] == S.STATUS_LYTTEPOST
+     and res_43["turnScore"] == 43 and res_43["status"] == S.STATUS_BOTTOM_WATCH,
+     f"Turn {res_50['turnScore']} (>= decay {E['lyttepostDecay']}) → "
+     f"{res_50['status']}\n    "
+     f"Turn {res_43['turnScore']} (< {E['lyttepostDecay']}) → "
+     f"{res_43['status']}\n    "
+     f"hysteresen hindrer at signalet blinker av og på rundt "
+     f"aktiveringsterskelen {E['lyttepost']}")
+
+# ── §8: LYTTEPOST BRUTT ──
+brudd_saker = {
+    "close under lagret low": dict(sterk, kurs=92.0),
+    "ny 20D-low med negativt 3D": dict(sterk, nyttLow20dIDag=True, return3d=-1.0),
+    "Turn under bruddterskel": lag_features(distanceFromLowPct=2.0),
+    "falling knife igjen": dict(sterk, nyttLow20dIDag=True, return3d=-9.0),
+}
+brudd_res = {navn: tidlig_med(f, lagret=signal) for navn, f in brudd_saker.items()}
+krav("§T9", "Alle fire invalidasjonsreglene setter LYTTEPOST BRUTT",
+     all(r["status"] == S.STATUS_LYTTEPOST_BRUTT for r in brudd_res.values())
+     and all(r["bruddGrunner"] for r in brudd_res.values()),
+     "\n    ".join(f"{navn:32s} → {r['status']} ({r['bruddGrunner'][0]})"
+                   for navn, r in brudd_res.items()))
+
+# Bruddet skal stå synlig, og deretter slippe taket
+etter_brudd = {"signalDato": "2026-09-01", "bruttDato": "2026-09-07",
+               "signalLocalLow": 95.0}
+IND_09 = {"lastDate": pd.Timestamp("2026-09-09")}
+_ekte_tf = S.tidlige_features
+S.tidlige_features = lambda ind, c=None: lag_features(distanceFromLowPct=2.0,
+                                                      ingenNyLow10dSiste3=True)
+try:
+    dagen_etter = S.vurder_tidlig_lag(IND_STUB, None, etter_brudd)
+    to_dager_etter = S.vurder_tidlig_lag(IND_09, None, etter_brudd)
+finally:
+    S.tidlige_features = _ekte_tf
+krav("§8", "LYTTEPOST BRUTT står minst én handelsdag, så slipper den taket",
+     dagen_etter["status"] == S.STATUS_LYTTEPOST_BRUTT
+     and to_dager_etter["status"] != S.STATUS_LYTTEPOST_BRUTT,
+     f"brutt 07.09 → 08.09 viser {dagen_etter['status']}, "
+     f"09.09 viser {to_dager_etter['status']}\n    "
+     f"brukeren skal rekke å se at den tidlige hypotesen feilet")
+
+# ── §1: dagens statuser skal stå urørt ──
+def status_med_tidlig(fase, sev, tidlig_status, **over):
+    r = {"phase": fase, "severity": sev, "recoveryScore": 80, "trendScore": 70,
+         "fundamentalsChecked": True, "thesisIntact": True, "eventRisk": False,
+         "early": {"status": tidlig_status}}
+    r.update(over)
+    return S.classify_status(r)
+
+
+krav("§T10", "LYTTEPOST viker for STABILIZING, REVERSAL og EVENT RISK",
+     status_med_tidlig(S.PHASE_RECOVERING, S.SEV_STRONG, S.STATUS_LYTTEPOST)
+     == S.STATUS_REVERSAL
+     and status_med_tidlig(S.PHASE_BASE_BUILDING, S.SEV_STRONG,
+                           S.STATUS_LYTTEPOST) == S.STATUS_STABILIZING
+     and status_med_tidlig(S.PHASE_EVENT_RISK, S.SEV_STRONG,
+                           S.STATUS_LYTTEPOST) == S.STATUS_EVENT_RISK
+     and status_med_tidlig(S.PHASE_FALLING, S.SEV_STRONG, S.STATUS_LYTTEPOST)
+     == S.STATUS_LYTTEPOST
+     and status_med_tidlig(S.PHASE_FALLING, S.SEV_STRONG, None)
+     == S.STATUS_STRONG_CORRECTION,
+     "REVERSAL, STABILIZING og EVENT RISK står lenger ute i stigen og vinner\n    "
+     "STRONG CORRECTION viker for LYTTEPOST — korreksjonsdybden er fortsatt "
+     "synlig i CORR og PCTL\n    "
+     "uten tidlig lag er statusen nøyaktig som før")
+
+
 # ── A: DNB vs NAS ──
 FALL = 7.0
 res = {t: scan(t, paalegg_fall(lag_df(**p), FALL, 18))

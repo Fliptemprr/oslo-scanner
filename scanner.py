@@ -248,6 +248,78 @@ SCANNER_CONFIG: dict[str, Any] = {
         },
     },
 
+    # ── Tidlig lag: BOTTOM WATCH og LYTTEPOST ──
+    # Laget kommer FØR full reversal-bekreftelse og tåler høyere feilrate.
+    # Alle tall her er V1-forslag fra spesifikasjonen og ment å kalibreres.
+    "early": {
+        "enabled": True,
+        "minBarer": 30,
+
+        # §2 Falling Knife Guard: minst to av fire sperrer hele laget
+        "knifeMinTreff": 2,
+        "knifeReturn3d": -6.0,
+        "knifeRsiDrop": 5.0,
+        "knifeVolRatio": 1.5,
+
+        # §3 Turn Score
+        "grupper": {
+            "A": ["ingenNy10dLow", "bedre3d", "mindreNegativeDager"],
+            "B": ["reaksjonFraSone", "loeftFraLow", "testetUtenNyLow"],
+            "C": ["momentum3d", "momentum5d", "rsiOpp", "toAvTrePositive"],
+            "D": ["positivDagMedVolum", "oppVolumOverNed", "volumMedSnuing"],
+            "E": ["higherLow", "sma20Reclaim", "bryterMotstand"],
+            "F": ["rsiAkselerasjon", "momentumSnudd"],
+        },
+        # A 20 · B 20 · C 20 · D 15 · E 15 · F 10 = 100
+        "poeng": {
+            "ingenNy10dLow": 10, "bedre3d": 5, "mindreNegativeDager": 5,
+            "reaksjonFraSone": 10, "loeftFraLow": 5, "testetUtenNyLow": 5,
+            "momentum3d": 8, "momentum5d": 5, "rsiOpp": 4, "toAvTrePositive": 3,
+            "positivDagMedVolum": 8, "oppVolumOverNed": 4, "volumMedSnuing": 3,
+            "higherLow": 7, "sma20Reclaim": 5, "bryterMotstand": 3,
+            "rsiAkselerasjon": 5, "momentumSnudd": 5,
+        },
+        # Kun A-E teller i kravet om minst tre positive grupper. F er et
+        # tillegg om endringstakt, ikke en selvstendig evidensgruppe.
+        "hovedgrupper": ["A", "B", "C", "D", "E"],
+        "bottomZonePct": 3.0,       # «innen 3 % av lokal 20D-low»
+        "bottomLookback": 5,        # hvor mange dager tilbake sonen kan ha vært testet
+        "loeftFraLowPct": 1.5,      # close minst så mye over dagens low
+        "momentum3dPct": 2.0,
+        "rsiOppPoeng": 4.0,
+        "volumeSpikeRatio": 1.2,
+        "volumeConfirmRatio": 1.0,
+        "volumeLookback": 5,
+        "motstandLookback": 5,      # siste 5D swing high
+
+        # §4 Entry Value: avstand fra lokal bunn, i prosent
+        "entryBands": [(3, 100), (5, 90), (8, 80), (12, 65), (16, 50), (20, 35)],
+        "entryElse": 20,
+        "entryDrawdownMin": 15.0,
+        "entryDrawdownBonus": 10,
+
+        # §5 statusterskler
+        "bottomWatch": 35,
+        "lyttepost": 55,
+        "entryMin": 60,
+        "minGrupper": 3,
+
+        # §6 styrke, og §7 decay tilbake til BOTTOM WATCH
+        "styrkebaand": [(75, "STRONG"), (65, "GOOD"), (55, "EARLY")],
+        "lyttepostDecay": 50,
+
+        # §8 invalidasjon
+        "bruttUnderLowPct": 2.0,
+        "bruttTurn": 35,
+        # Bruddet står i minst én handelsdag etter at det inntraff, slik at
+        # brukeren rekker å se at hypotesen feilet.
+        "bruttSynligHandelsdager": 1,
+
+        # §10 rangering
+        "opportunityTurnVekt": 0.6,
+        "opportunityEntryVekt": 0.4,
+    },
+
     # ── Corporate actions ──
     # Yahoo justerer for utbytte og splitt, men IKKE for fisjon/spin-off.
     # KOG falt 398.50 → 328.38 ved åpning 15.04.2026, med 15.04 sin high under
@@ -711,25 +783,37 @@ STATUS_STABILIZING = "STABILIZING"
 STATUS_REVERSAL = "REVERSAL"
 STATUS_EVENT_RISK = "EVENT_RISK"
 
+# Tidlig lag, mellom WAIT og STABILIZING i stigen
+STATUS_BOTTOM_WATCH = "BOTTOM_WATCH"
+STATUS_LYTTEPOST = "LYTTEPOST"
+STATUS_LYTTEPOST_BRUTT = "LYTTEPOST_BRUTT"
+
 STATUS_LABEL = {
     STATUS_EVENT_RISK: "🔴 EVENT RISK",
     STATUS_REVERSAL: "🟢 REVERSAL",
     STATUS_STABILIZING: "🔵 STABILIZING",
+    STATUS_LYTTEPOST: "🟣 LYTTEPOST",
+    STATUS_LYTTEPOST_BRUTT: "⛔ LYTTEPOST BRUTT",
     STATUS_STRONG_CORRECTION: "🟠 STRONG CORRECTION",
     STATUS_CORRECTION: "🟡 CORRECTION",
+    STATUS_BOTTOM_WATCH: "🔎 BOTTOM WATCH",
     STATUS_FOLLOW: "⚪ FOLLOW",
     STATUS_WAIT: "⚫ WAIT",
 }
 
-# Sortering: det som krever oppmerksomhet først (§18)
+# Sortering: det som krever oppmerksomhet først (§18). LYTTEPOST legger seg
+# rett under STABILIZING, slik stigen i spesifikasjonen sier.
 STATUS_PRIORITY = {
     STATUS_EVENT_RISK: 0,
     STATUS_REVERSAL: 1,
     STATUS_STABILIZING: 2,
-    STATUS_STRONG_CORRECTION: 3,
-    STATUS_CORRECTION: 4,
-    STATUS_FOLLOW: 5,
-    STATUS_WAIT: 6,
+    STATUS_LYTTEPOST: 3,
+    STATUS_LYTTEPOST_BRUTT: 4,
+    STATUS_STRONG_CORRECTION: 5,
+    STATUS_CORRECTION: 6,
+    STATUS_BOTTOM_WATCH: 7,
+    STATUS_FOLLOW: 8,
+    STATUS_WAIT: 9,
 }
 
 
@@ -1550,6 +1634,339 @@ def detect_event_risk(ind: dict, current: Optional[CorrectionEvent],
 # ENGINE
 # ══════════════════════════════════════════════════════════════
 
+# ══════════════════════════════════════════════════════════════
+# TIDLIG LAG – BOTTOM WATCH og LYTTEPOST
+#
+# Stigen er WAIT → BOTTOM WATCH → LYTTEPOST → STABILIZING →
+# REVERSAL. Laget kommer bevisst FØR full reversal-bekreftelse og
+# tåler høyere feilrate: hensikten er å finne et attraktivt tidlig
+# inngangsområde mens kursen fortsatt ligger nær korreksjonsbunnen.
+#
+# LYTTEPOST er ikke et kjøpssignal. Den sier at fallet er i ferd
+# med å endre karakter, og at inngangen fortsatt er nær bunnen.
+#
+# Spesifikasjonen er stedvis løst formulert. Hver tolkning står som
+# kommentar på kriteriet den gjelder, og alle tall ligger i
+# SCANNER_CONFIG["early"] slik at de kan justeres uten kodeendring.
+# ══════════════════════════════════════════════════════════════
+
+def _abs_neg_snitt(avk) -> float:
+    """Gjennomsnittlig størrelse på de negative dagene i et utsnitt."""
+    neg = [abs(float(x)) for x in avk if pd.notna(x) and float(x) < 0]
+    return sum(neg) / len(neg) if neg else 0.0
+
+
+def tidlige_features(ind: dict, cfg: dict = SCANNER_CONFIG) -> Optional[dict]:
+    """
+    Råstoffet til Turn Score og Entry Value, alt utledet av daglig OHLCV.
+
+    Ingen nye eksterne datakilder: dette er de samme seriene motoren
+    allerede har, satt sammen på nytt.
+    """
+    e = cfg["early"]
+    c, h, l, v = ind["close"], ind["high"], ind["low"], ind["volume"]
+    rsi, volr = ind["rsi_s"], ind["volRatio_s"]
+    if len(c) < e["minBarer"]:
+        return None
+
+    kurs = float(c.iloc[-1])
+    dagsavk = c.pct_change() * 100
+
+    low20 = _num(l.tail(20).min())
+    low10 = _num(l.tail(10).min())
+    if low20 is None or low20 <= 0:
+        return None
+
+    # «Close lager nytt low» måles på close, slik spesifikasjonen sier —
+    # ikke på intradag low. En veke under et gammelt lavpunkt er noe annet
+    # enn en close under det.
+    ny20 = c <= c.rolling(20).min() + 1e-9
+    ny10 = c <= c.rolling(10).min() + 1e-9
+
+    r3 = safe_pct(kurs, _bars_ago(c, 3))
+    r5 = safe_pct(kurs, _bars_ago(c, 5))
+    r3_forrige = safe_pct(_bars_ago(c, 3), _bars_ago(c, 6))
+
+    rsi_naa, rsi_3, rsi_6 = _last(rsi), _bars_ago(rsi, 3), _bars_ago(rsi, 6)
+    rsi_endring3 = (rsi_naa - rsi_3) if None not in (rsi_naa, rsi_3) else None
+    rsi_endring_forrige = (rsi_3 - rsi_6) if None not in (rsi_3, rsi_6) else None
+
+    # Volum på positive mot negative dager, siste fem
+    opp = dagsavk > 0
+    vol5, opp5 = v.tail(5), opp.tail(5)
+    vol_opp = _num(vol5[opp5].mean()) if bool(opp5.any()) else None
+    vol_ned = _num(vol5[~opp5].mean()) if bool((~opp5).any()) else None
+
+    vindu = min(e["volumeLookback"], len(c) - 1)
+    positiv_med_volum = any(
+        float(dagsavk.iloc[-k]) > 0
+        and _num(volr.iloc[-k]) is not None
+        and float(volr.iloc[-k]) >= e["volumeSpikeRatio"]
+        for k in range(1, vindu + 1))
+
+    # Bunnsonen: 20D-low pluss en margin. «Innen 3 % av lokal 20D-low.»
+    sone = low20 * (1 + e["bottomZonePct"] / 100)
+    testet_sone = bool(_num(l.tail(e["bottomLookback"]).min()) <= sone)
+    dagens_low = float(l.iloc[-1])
+    loeft_fra_dagens_low = safe_pct(kurs, dagens_low)
+
+    forrige_low10 = _num(l.iloc[-20:-10].min()) if len(l) >= 20 else None
+    swing_high5 = _num(h.iloc[-(e["motstandLookback"] + 1):-1].max())
+
+    momentum_snudd = bool(r3 is not None and r3_forrige is not None
+                          and r3_forrige < 0 < r3)
+
+    return {
+        "kurs": kurs,
+        "localLow20d": low20,
+        "localLow10d": low10,
+        "distanceFromLowPct": safe_pct(kurs, low20),
+        "return3d": r3,
+        "return5d": r5,
+        "return3dForrige": r3_forrige,
+        "rsi": rsi_naa,
+        "rsiChange3d": rsi_endring3,
+        "rsiChangeForrige3d": rsi_endring_forrige,
+        "volumeRatio20d": _num(volr.iloc[-1]) if len(volr) else None,
+        "upVolumeRatio": (vol_opp / vol_ned) if vol_opp and vol_ned else None,
+        "volOpp": vol_opp,
+        "volNed": vol_ned,
+        "positivDagMedVolum": positiv_med_volum,
+        "negSnitt3d": _abs_neg_snitt(dagsavk.tail(3)),
+        "negSnittForrige3d": _abs_neg_snitt(dagsavk.iloc[-6:-3]),
+        "nyttLow20dIDag": bool(ny20.iloc[-1]),
+        "nyLow20dSiste3": bool(ny20.tail(3).any()),
+        "ingenNyLow10dSiste3": not bool(ny10.tail(3).any()),
+        "testetBunnsone": testet_sone,
+        "overBunnsone": bool(kurs > sone),
+        "testerSoneIDag": bool(dagens_low <= sone),
+        "loeftFraDagensLow": loeft_fra_dagens_low,
+        "positiveSiste3": int(sum(1 for x in dagsavk.tail(3)
+                                  if pd.notna(x) and float(x) > 0)),
+        "dagensDagErNegativ": bool(pd.notna(dagsavk.iloc[-1])
+                                   and float(dagsavk.iloc[-1]) < 0),
+        "higherLow": bool(low10 is not None and forrige_low10 is not None
+                          and low10 > forrige_low10),
+        "sma20Reclaim": bool(ind.get("sma20") and kurs > ind["sma20"]),
+        "bryterMotstand": bool(swing_high5 and kurs > swing_high5),
+        "momentumSnudd": momentum_snudd,
+    }
+
+
+def falling_knife_guard(f: dict, cfg: dict = SCANNER_CONFIG) -> tuple:
+    """
+    §2: sperren som skal hindre at en stor korreksjon alene blir et signal.
+
+    En aksje i fritt fall skal aldri kunne få LYTTEPOST. Minst to av fire
+    tegn på akselererende fall er nok til å sperre hele laget.
+    """
+    e = cfg["early"]
+    treff = {
+        "nyttLow": f["nyttLow20dIDag"],
+        "fall3d": f["return3d"] is not None and f["return3d"] < e["knifeReturn3d"],
+        "rsiStuper": (f["rsiChange3d"] is not None
+                      and f["rsiChange3d"] < -e["knifeRsiDrop"]),
+        "negativtVolum": (f["dagensDagErNegativ"]
+                          and f["volumeRatio20d"] is not None
+                          and f["volumeRatio20d"] > e["knifeVolRatio"]),
+    }
+    aktive = [k for k, v in treff.items() if v]
+    return len(aktive) >= e["knifeMinTreff"], aktive
+
+
+def turn_score(f: dict, cfg: dict = SCANNER_CONFIG) -> tuple:
+    """
+    §3: hvor mye evidens vi har for at fallet er i ferd med å stoppe. 0–100.
+
+    Seks grupper, ingen av dem obligatorisk. Det er bevisst: en vending kan
+    like gjerne vise seg som bunnreaksjon pluss volum som via higher low og
+    RSI. Derfor kreves ikke én bestemt kombinasjon.
+    """
+    e = cfg["early"]
+    p, grupper = e["poeng"], e["grupper"]
+
+    k = {
+        # A – fallmomentum avtar
+        "ingenNy10dLow": f["ingenNyLow10dSiste3"],
+        "bedre3d": (f["return3d"] is not None and f["return3dForrige"] is not None
+                    and f["return3d"] > f["return3dForrige"]),
+        "mindreNegativeDager": (f["negSnittForrige3d"] > 0
+                                and f["negSnitt3d"] < f["negSnittForrige3d"]),
+        # B – bunnreaksjon. Tyngste enkeltkriterium ligger her.
+        "reaksjonFraSone": f["testetBunnsone"] and f["overBunnsone"],
+        "loeftFraLow": (f["testerSoneIDag"] and f["loeftFraDagensLow"] is not None
+                        and f["loeftFraDagensLow"] >= e["loeftFraLowPct"]),
+        "testetUtenNyLow": f["testetBunnsone"] and not f["nyLow20dSiste3"],
+        # C – kort momentum snur. Ingen krav om tre grønne dager.
+        "momentum3d": f["return3d"] is not None and f["return3d"] > e["momentum3dPct"],
+        "momentum5d": f["return5d"] is not None and f["return5d"] > 0,
+        "rsiOpp": (f["rsiChange3d"] is not None
+                   and f["rsiChange3d"] >= e["rsiOppPoeng"]),
+        "toAvTrePositive": f["positiveSiste3"] >= 2,
+        # D – volum er støtte, ikke krav
+        "positivDagMedVolum": f["positivDagMedVolum"],
+        "oppVolumOverNed": (f["upVolumeRatio"] is not None
+                            and f["upVolumeRatio"] > 1.0),
+        "volumMedSnuing": (f["momentumSnudd"] and f["volumeRatio20d"] is not None
+                           and f["volumeRatio20d"] >= e["volumeConfirmRatio"]),
+        # E – prisstruktur. Ingen krav om SMA50 eller SMA200 i LYTTEPOST.
+        "higherLow": f["higherLow"],
+        "sma20Reclaim": f["sma20Reclaim"],
+        "bryterMotstand": f["bryterMotstand"],
+        # F – signalhastighet: endring, ikke bare nivå
+        "rsiAkselerasjon": (f["rsiChange3d"] is not None
+                            and f["rsiChangeForrige3d"] is not None
+                            and f["rsiChange3d"] > 0
+                            and f["rsiChange3d"] > f["rsiChangeForrige3d"]),
+        "momentumSnudd": f["momentumSnudd"],
+    }
+
+    gruppepoeng = {navn: sum(p[n] for n in nokler if k[n])
+                   for navn, nokler in grupper.items()}
+    return float(sum(gruppepoeng.values())), gruppepoeng, k
+
+
+def entry_value(f: dict, cc: Optional["CorrectionEvent"],
+                cfg: dict = SCANNER_CONFIG) -> float:
+    """
+    §4: hvor attraktiv inngangen fortsatt er HVIS vendingen lykkes.
+
+    Holdes bevisst utenfor Turn Score. Det er dette som gjør at KIT på 87.60
+    kan være en bedre inngang enn KIT på 95.40, selv om den tekniske
+    vendingen er bedre bekreftet på 95.40.
+    """
+    e = cfg["early"]
+    d = f["distanceFromLowPct"]
+    if d is None:
+        return 0.0
+
+    score = e["entryElse"]
+    for grense, verdi in e["entryBands"]:
+        if d <= grense:
+            score = verdi
+            break
+
+    if cc is not None and cc.currentDrawdownPct >= e["entryDrawdownMin"]:
+        score += e["entryDrawdownBonus"]
+    return float(min(100, score))
+
+
+def lyttepost_styrke(turn: float, cfg: dict = SCANNER_CONFIG) -> Optional[str]:
+    """§6: EARLY, GOOD eller STRONG. Alle heter fortsatt LYTTEPOST."""
+    for grense, navn in cfg["early"]["styrkebaand"]:
+        if turn >= grense:
+            return navn
+    return None
+
+
+def opportunity_score(turn: float, entry: float,
+                      cfg: dict = SCANNER_CONFIG) -> float:
+    """
+    §10: rangering av tidlige signaler.
+
+    Turn alene ville rangert den bekreftede, men utstrakte aksjen over den
+    tidlige. Vekting mot Entry Value er nettopp poenget med laget.
+    """
+    e = cfg["early"]
+    return round(e["opportunityTurnVekt"] * turn
+                 + e["opportunityEntryVekt"] * entry, 1)
+
+
+def vurder_tidlig_lag(ind: dict, cc: Optional["CorrectionEvent"],
+                      lagret: Optional[dict] = None,
+                      cfg: dict = SCANNER_CONFIG) -> dict:
+    """
+    §5, §7 og §8: status, forsterkning, svekkelse og invalidasjon.
+
+    Livssyklusen er aktivering → decay tilbake til BOTTOM WATCH → eventuelt
+    LYTTEPOST BRUTT. Signalet lagres ved aktivering, slik at brudd kan måles
+    mot der hypotesen faktisk startet og ikke mot dagens bunn.
+    """
+    e = cfg["early"]
+    tom = {"aktiv": False, "status": None, "turnScore": None, "entryValue": None,
+           "styrke": None, "opportunityScore": None, "fallingKnife": False,
+           "knivGrunner": [], "grupper": {}, "kriterier": {}, "features": None,
+           "bruddGrunner": [], "tilstand": dict(lagret or {})}
+    if not e["enabled"]:
+        return tom
+
+    f = tidlige_features(ind, cfg)
+    if f is None:
+        return tom
+
+    kniv, knivgrunner = falling_knife_guard(f, cfg)
+    turn, grupper, kriterier = turn_score(f, cfg)
+    entry = entry_value(f, cc, cfg)
+    positive_grupper = sum(1 for g in e["hovedgrupper"] if grupper.get(g, 0) > 0)
+
+    bar_dato = ind["lastDate"].date() if hasattr(ind["lastDate"], "date") else ind["lastDate"]
+    tilstand = dict(lagret or {})
+    aktivt_signal = bool(tilstand.get("signalDato")) and not tilstand.get("bruttDato")
+
+    # §8: invalidasjon måles mot det lagrede signalet, ikke mot dagens bunn
+    brudd = []
+    if aktivt_signal:
+        lagret_low = _num(tilstand.get("signalLocalLow"))
+        if lagret_low and f["kurs"] < lagret_low * (1 - e["bruttUnderLowPct"] / 100):
+            brudd.append("close under lagret low")
+        if f["nyttLow20dIDag"] and (f["return3d"] or 0) < 0:
+            brudd.append("ny 20D-low med negativt 3D-momentum")
+        if turn < e["bruttTurn"]:
+            brudd.append("Turn Score under bruddterskel")
+        if kniv:
+            brudd.append("falling knife aktiv igjen")
+
+    status = None
+    if brudd:
+        status = STATUS_LYTTEPOST_BRUTT
+        tilstand["bruttDato"] = str(bar_dato)
+        tilstand["bruddGrunner"] = brudd
+    elif aktivt_signal:
+        # §7: signalet beholdes ned til decay-terskelen, ikke bare så lenge
+        # aktiveringskravet er oppfylt. Uten hysterese ville et signal blinke
+        # av og på rundt 55.
+        status = (STATUS_LYTTEPOST if turn >= e["lyttepostDecay"]
+                  else STATUS_BOTTOM_WATCH)
+    elif kniv:
+        # §2/§5: ingen LYTTEPOST, og BOTTOM WATCH krever falling_knife = FALSE
+        status = None
+    elif (turn >= e["lyttepost"] and entry >= e["entryMin"]
+          and positive_grupper >= e["minGrupper"]):
+        status = STATUS_LYTTEPOST
+        tilstand = {"signalDato": str(bar_dato), "signalKurs": f["kurs"],
+                    "signalLocalLow": f["localLow20d"], "signalTurnScore": turn}
+    elif turn >= e["bottomWatch"]:
+        status = STATUS_BOTTOM_WATCH
+
+    # §8: bruddet skal stå en stund, ellers rekker brukeren aldri å se at
+    # den tidlige hypotesen feilet.
+    if status in (None, STATUS_BOTTOM_WATCH) and tilstand.get("bruttDato"):
+        try:
+            brutt_dato = date.fromisoformat(str(tilstand["bruttDato"]))
+            if _handelsdager_mellom(brutt_dato, bar_dato) <= e["bruttSynligHandelsdager"]:
+                status = STATUS_LYTTEPOST_BRUTT
+        except ValueError:
+            pass
+
+    styrke = lyttepost_styrke(turn, cfg) if status == STATUS_LYTTEPOST else None
+    return {
+        "aktiv": status is not None,
+        "status": status,
+        "turnScore": round(turn),
+        "entryValue": round(entry),
+        "styrke": styrke,
+        "opportunityScore": opportunity_score(turn, entry, cfg),
+        "fallingKnife": kniv,
+        "knivGrunner": knivgrunner,
+        "grupper": grupper,
+        "kriterier": kriterier,
+        "features": f,
+        "bruddGrunner": brudd,
+        "positiveGrupper": positive_grupper,
+        "tilstand": tilstand,
+    }
+
+
 def classify_status(r: dict, cfg: dict = SCANNER_CONFIG) -> str:
     """
     §20: brukerstatusen utledes av intern fase og alvorlighetsgrad.
@@ -1559,6 +1976,22 @@ def classify_status(r: dict, cfg: dict = SCANNER_CONFIG) -> str:
     severity internt fortsatt er STRONG_CORRECTION. Vi tvinger den ikke til å
     bli værende på det verste den har vært.
     """
+    klassisk = _klassisk_status(r, cfg)
+
+    # Det tidlige laget legges foran de klassiske statusene, men aldri foran
+    # EVENT RISK, STABILIZING eller REVERSAL: de står lenger ute i stigen og
+    # er allerede bekreftet. Korreksjonsdybden er fortsatt synlig i CORR- og
+    # PCTL-kolonnene, så ingenting går tapt ved at LYTTEPOST vises i stedet
+    # for CORRECTION.
+    tidlig = (r.get("early") or {}).get("status")
+    if tidlig and klassisk not in (STATUS_EVENT_RISK, STATUS_STABILIZING,
+                                   STATUS_REVERSAL):
+        return tidlig
+    return klassisk
+
+
+def _klassisk_status(r: dict, cfg: dict = SCANNER_CONFIG) -> str:
+    """Statusen slik den var før det tidlige laget. Uendret logikk."""
     fase, sev = r["phase"], r["severity"]
 
     if fase == PHASE_EVENT_RISK:
@@ -1622,7 +2055,8 @@ def resolve_fundamentals(store: dict, ticker: str, correction_id: str,
 
 def scan_stock(ticker: str, df: pd.DataFrame, fund_store: dict,
                lagret_state: Optional[dict] = None,
-               cfg: dict = SCANNER_CONFIG) -> Optional[dict]:
+               cfg: dict = SCANNER_CONFIG,
+               lyttepost_state: Optional[dict] = None) -> Optional[dict]:
     """
     Hovedmotoren for én aksje.
 
@@ -1670,9 +2104,12 @@ def scan_stock(ticker: str, df: pd.DataFrame, fund_store: dict,
     cc.phase = bestem_fase(cc, recovery_score, higher_low, event_risk,
                            fund.fundamentalsChecked, cfg)
 
+    tidlig = vurder_tidlig_lag(ind, cc, lyttepost_state, cfg)
+
     resultat = {
         "ticker": ticker,
         "Ticker": ticker.replace(".OL", ""),
+        "early": tidlig,
         "Navn": OSLO_TICKERS.get(ticker, ticker),
         "correctionScore": correction_score,
         "trendScore": trend_score,
@@ -1801,6 +2238,7 @@ def last_state() -> dict:
     raw.setdefault("alerts", [])
     raw.setdefault("corrections", {})
     raw.setdefault("varslet", {})
+    raw.setdefault("lyttepost", {})
     return raw
 
 
@@ -2811,11 +3249,21 @@ def kjor_scan(prisdata: dict, fund_store: dict, state: Optional[dict] = None,
     beregnes på siste avsluttede handelsdag.
     """
     lagrede = (state or {}).get("corrections", {})
+    lyttepost = (state or {}).setdefault("lyttepost", {}) if state is not None else {}
     ut = []
     for ticker, df in prisdata.items():
         try:
-            r = scan_stock(ticker, df, fund_store, lagrede.get(ticker), cfg)
+            r = scan_stock(ticker, df, fund_store, lagrede.get(ticker), cfg,
+                           lyttepost.get(ticker))
             if r is not None:
+                # Signalet må overleve til neste skanning, ellers kan brudd
+                # ikke måles mot der hypotesen faktisk startet.
+                tilstand = (r.get("early") or {}).get("tilstand")
+                if state is not None:
+                    if tilstand:
+                        lyttepost[ticker] = tilstand
+                    else:
+                        lyttepost.pop(ticker, None)
                 ut.append(r)
         except Exception as e:
             log.warning(f"[{ticker}] scan feilet: {type(e).__name__}: {e}")
@@ -2845,6 +3293,7 @@ DC = {
     "roed": "#FF4757",
     "orange": "#FF9130",
     "gul": "#E8C547",
+    "lilla": "#A98BFF",     # tidlig lag: LYTTEPOST
 }
 
 MONO = "'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace"
@@ -2854,8 +3303,11 @@ STATUS_FARGE = {
     STATUS_EVENT_RISK: DC["roed"],
     STATUS_REVERSAL: DC["gronn"],
     STATUS_STABILIZING: DC["blaa"],
+    STATUS_LYTTEPOST: DC["lilla"],
+    STATUS_LYTTEPOST_BRUTT: "#8C5560",
     STATUS_STRONG_CORRECTION: DC["orange"],
     STATUS_CORRECTION: DC["gul"],
+    STATUS_BOTTOM_WATCH: "#7E8AA0",
     STATUS_FOLLOW: "#A5AFBF",
     STATUS_WAIT: "#6B7686",
 }
@@ -2864,18 +3316,23 @@ STATUS_TEKST = {
     STATUS_EVENT_RISK: "EVENT RISK",
     STATUS_REVERSAL: "REVERSAL",
     STATUS_STABILIZING: "STABILIZING",
+    STATUS_LYTTEPOST: "LYTTEPOST",
+    STATUS_LYTTEPOST_BRUTT: "LYTTEPOST BRUTT",
     STATUS_STRONG_CORRECTION: "STRONG CORRECTION",
     STATUS_CORRECTION: "CORRECTION",
+    STATUS_BOTTOM_WATCH: "BOTTOM WATCH",
     STATUS_FOLLOW: "FOLLOW",
     STATUS_WAIT: "WAIT",
 }
 
-STATUS_KORT = {**STATUS_TEKST, STATUS_STRONG_CORRECTION: "STRONG CORR"}
+STATUS_KORT = {**STATUS_TEKST, STATUS_STRONG_CORRECTION: "STRONG CORR",
+               STATUS_LYTTEPOST_BRUTT: "LP BRUTT"}
 
 # Rekkefølgen på statustellerne i toppen
 TELLER_REKKEFOLGE = [
-    STATUS_EVENT_RISK, STATUS_REVERSAL, STATUS_STABILIZING,
-    STATUS_STRONG_CORRECTION, STATUS_CORRECTION, STATUS_FOLLOW, STATUS_WAIT,
+    STATUS_EVENT_RISK, STATUS_REVERSAL, STATUS_STABILIZING, STATUS_LYTTEPOST,
+    STATUS_STRONG_CORRECTION, STATUS_CORRECTION, STATUS_BOTTOM_WATCH,
+    STATUS_FOLLOW, STATUS_WAIT,
 ]
 
 # Sonene brukes i KORT-visningen
@@ -2883,13 +3340,15 @@ SONER = [
     {"navn": "KREVER GJENNOMGANG", "farge": DC["roed"], "form": "stor",
      "statuser": [STATUS_EVENT_RISK, STATUS_REVERSAL]},
     {"navn": "FØLG", "farge": DC["blaa"], "form": "medium",
-     "statuser": [STATUS_STABILIZING, STATUS_STRONG_CORRECTION, STATUS_CORRECTION]},
+     "statuser": [STATUS_STABILIZING, STATUS_LYTTEPOST, STATUS_LYTTEPOST_BRUTT,
+                  STATUS_STRONG_CORRECTION, STATUS_CORRECTION]},
     {"navn": "ROLIG", "farge": DC["svak"], "form": "kompakt",
-     "statuser": [STATUS_FOLLOW, STATUS_WAIT]},
+     "statuser": [STATUS_BOTTOM_WATCH, STATUS_FOLLOW, STATUS_WAIT]},
 ]
 
 SORTERINGSVALG = {
     "Prioritet": None,
+    "Opportunity Score": "opportunity",
     "Correction Score": "correctionScore",
     "Recovery Score": "recoveryScore",
     "Trend Score": "trendScore",
@@ -3252,7 +3711,10 @@ def tabell_rader(resultater: list) -> pd.DataFrame:
     rader = []
     for r in resultater:
         cc, ind = r.get("currentCorrection"), r["ind"]
+        tidlig = r.get("early") or {}
         status = STATUS_KORT[r["status"]]
+        if r["status"] == STATUS_LYTTEPOST and tidlig.get("styrke"):
+            status += f" – {tidlig['styrke']}"
         if reversal_blokkert(r):
             status += " · GATE"
         fase = {PHASE_FALLING: "↓", PHASE_BASE_BUILDING: "=",
@@ -3266,6 +3728,8 @@ def tabell_rader(resultater: list) -> pd.DataFrame:
             "CORR": r["correctionScore"],
             "TREND": r["trendScore"],
             "RECOV": r["recoveryScore"],
+            "TURN": tidlig.get("turnScore"),
+            "ENTRY": tidlig.get("entryValue"),
             "KORR %": -cc.currentDrawdownPct if cc else None,
             "PCTL": r["correctionPercentile"],
             "DAGER": cc.daysSincePeak if cc else None,
@@ -3554,6 +4018,76 @@ def kriterieliste_html(tittel: str, score: float, deler: dict,
             f'{score:.0f}</span></div>{"".join(rader)}</div>')
 
 
+# §9: de seks tegnene brukeren skal kunne lese av. Fire av dem er hele
+# grupper fra Turn Score, to er enkeltkriterier som er lette å kjenne igjen
+# på grafen. Scanneren skal være forklarbar.
+TIDLIG_ETIKETTER = [
+    ("gruppe", "A", "Fallmomentum avtar", "Fallmomentum avtar ikke"),
+    ("gruppe", "B", "Bunnreaksjon", "Ingen bunnreaksjon"),
+    ("gruppe", "C", "Kort momentum positivt", "Kort momentum ikke positivt"),
+    ("gruppe", "D", "Volumstøtte", "Ingen volumstøtte"),
+    ("kriterium", "higherLow", "Higher low etablert", "Higher low ikke etablert"),
+    ("kriterium", "sma20Reclaim", "SMA20 reclaimet", "SMA20 ikke reclaimet"),
+]
+
+
+def tidlig_html(r: dict) -> str:
+    """Hvorfor det tidlige laget mener risikoen er interessant."""
+    e = r.get("early") or {}
+    if not e.get("turnScore") and not e.get("aktiv"):
+        return ""
+
+    grupper, kriterier = e.get("grupper", {}), e.get("kriterier", {})
+    rader, aktive = [], 0
+    for slag, nokkel, ja, nei in TIDLIG_ETIKETTER:
+        truffet = (grupper.get(nokkel, 0) > 0 if slag == "gruppe"
+                   else bool(kriterier.get(nokkel)))
+        aktive += int(truffet)
+        rader.append(
+            f'<div style="display:flex;gap:8px;align-items:center;padding:4px 0;'
+            f'font-size:12px;color:{DC["dempet"] if truffet else DC["svakest"]};">'
+            f'<span style="color:{DC["gronn"] if truffet else DC["kant"]};">'
+            f'{"✓" if truffet else "○"}</span><span>{ja if truffet else nei}</span>'
+            f'</div>')
+
+    if e.get("fallingKnife"):
+        sperre = (f'<div style="margin-top:8px;font-size:12px;color:{DC["orange"]};">'
+                  f'⚠ Falling Knife Guard aktiv — fallet akselererer fortsatt. '
+                  f'Ingen LYTTEPOST.</div>')
+    elif e.get("bruddGrunner"):
+        sperre = (f'<div style="margin-top:8px;font-size:12px;color:{DC["roed"]};">'
+                  f'⛔ Brutt: {", ".join(e["bruddGrunner"])}.</div>')
+    else:
+        sperre = ""
+
+    tittel = STATUS_TEKST.get(e.get("status"), "INGEN TIDLIG STATUS")
+    if e.get("styrke"):
+        tittel += f" – {e['styrke']}"
+
+    return (
+        f'<div style="margin-bottom:14px;">'
+        f'<div style="font-family:{MONO};font-size:10px;letter-spacing:0.1em;'
+        f'color:{DC["svak"]};margin-bottom:4px;">TIDLIG LAG · {tittel}</div>'
+        f'<div style="display:flex;gap:18px;margin-bottom:8px;">'
+        f'<span style="font-family:{MONO};font-size:12px;color:{DC["dempet"]};">'
+        f'Turn <b style="color:{DC["tekst"]};font-size:16px;">'
+        f'{e.get("turnScore", 0)}</b></span>'
+        f'<span style="font-family:{MONO};font-size:12px;color:{DC["dempet"]};">'
+        f'Entry <b style="color:{DC["tekst"]};font-size:16px;">'
+        f'{e.get("entryValue", 0)}</b></span>'
+        f'<span style="font-family:{MONO};font-size:12px;color:{DC["dempet"]};">'
+        f'Opportunity <b style="color:{DC["tekst"]};font-size:16px;">'
+        f'{e.get("opportunityScore", 0):.0f}</b></span></div>'
+        + "".join(rader)
+        + f'<div style="margin-top:6px;font-family:{MONO};font-size:11px;'
+          f'color:{DC["svak"]};">{aktive}/6 tidlige signaler aktive</div>'
+        + sperre
+        + f'<div style="margin-top:8px;font-size:11px;color:{DC["svakest"]};'
+          f'line-height:1.5;">Det tidlige laget kommer før full '
+          f'reversal-bekreftelse og tåler høyere feilrate. Det er ingen '
+          f'kjøpsanbefaling.</div></div>')
+
+
 def korreksjonsforlop_html(r: dict) -> str:
     cc = r.get("currentCorrection")
     if not cc:
@@ -3777,11 +4311,23 @@ def sorter_resultater(resultater: list, valg: str) -> list:
     if valg == "Korreksjon %":
         return sorted(resultater, key=lambda r: -(r["currentCorrection"].currentDrawdownPct
                                                   if r.get("currentCorrection") else -999))
+    if valg == "Opportunity Score":
+        return sorted(resultater,
+                      key=lambda r: -((r.get("early") or {}).get("opportunityScore") or -1))
     felt = SORTERINGSVALG.get(valg)
     if felt:
         return sorted(resultater, key=lambda r: -r[felt])
-    return sorted(resultater, key=lambda r: (STATUS_PRIORITY.get(r["status"], 99),
-                                             -r["correctionScore"]))
+    # §10: LYTTEPOST rangeres på Opportunity Score, ikke Turn Score alene.
+    # Ellers ville den bekreftede, men utstrakte aksjen alltid ligge over den
+    # tidlige — som er stikk i strid med hensikten med laget.
+    def nokkel(r):
+        tidlig = r.get("early") or {}
+        opp = tidlig.get("opportunityScore")
+        return (STATUS_PRIORITY.get(r["status"], 99),
+                -(opp if opp is not None and r["status"] in
+                  (STATUS_LYTTEPOST, STATUS_BOTTOM_WATCH) else r["correctionScore"]))
+
+    return sorted(resultater, key=nokkel)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -3906,8 +4452,9 @@ def _hoyrepanel(r: dict, fund_store: dict, dstatus: dict = None) -> bool:
 
         t1, t2, t3, t4 = st.tabs(["KRITERIER", "KORREKSJON", "HISTORIKK", "NØKKELTALL"])
         with t1:
-            st.html(kriterieliste_html("TREND SCORE", r["trendScore"], r["trendDeler"],
-                                       SCANNER_CONFIG["trendPoints"], TREND_ETIKETTER)
+            st.html(tidlig_html(r)
+                    + kriterieliste_html("TREND SCORE", r["trendScore"], r["trendDeler"],
+                                         SCANNER_CONFIG["trendPoints"], TREND_ETIKETTER)
                     + kriterieliste_html("RECOVERY SCORE", r["recoveryScore"],
                                          r["recoveryDeler"],
                                          SCANNER_CONFIG["recoveryPoints"], RECOVERY_ETIKETTER))

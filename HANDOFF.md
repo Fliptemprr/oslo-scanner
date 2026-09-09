@@ -27,7 +27,7 @@ egen historikk av korreksjoner, funnet med ATR-normalisert ZigZag. Et fall på
 | Fil | Innhold |
 |---|---|
 | `scanner.py` | Hele appen, ~3800 linjer. Config → typer → indikatorer → handelskalender → swings → scorer → motor → datahenting → UI |
-| `test_scanner.py` | 47 akseptansetester. Kjøres uten nett, med syntetiske kursserier |
+| `test_scanner.py` | 58 akseptansetester. Kjøres uten nett, med syntetiske kursserier |
 | `sjekk_data.py` | Frittstående diagnose av datakildene. Krever nett |
 | `.streamlit/config.toml` | Mørkt tema |
 | `README.md` | Kort produktbeskrivelse |
@@ -43,7 +43,7 @@ gitignorert. Streamlit Cloud har flyktig disk, så listen faller tilbake til
 1. **Ikke endre trading-logikken** — Correction Score, Trend Score, Recovery
    Score, phase, severity, statusmotoren, event risk — uten at brukeren
    eksplisitt gir nye regler. Masterspesifikasjonen styrer, ikke egne ideer.
-2. **`python test_scanner.py` skal være 47/47 før hver push.** Feiler noe,
+2. **`python test_scanner.py` skal være 58/58 før hver push.** Feiler noe,
    er det enten en reell regresjon eller en dårlig test. Begge må undersøkes,
    ingen av dem ignoreres.
 3. **`python -c "import ast; ast.parse(open('scanner.py').read())"` etter hver
@@ -284,6 +284,53 @@ To designvalg som er lette å ødelegge ved et uhell:
 
 ---
 
+## 5b. Tidlig lag — BOTTOM WATCH og LYTTEPOST (09.09.2026)
+
+Bygget etter Erlends spesifikasjon, implementert bokstavelig. Stigen er
+`WAIT → BOTTOM WATCH → LYTTEPOST → STABILIZING → REVERSAL`.
+
+Laget kommer bevisst før full reversal-bekreftelse og tåler høyere feilrate.
+**LYTTEPOST er ikke et kjøpssignal.**
+
+| Del | Hvor |
+|---|---|
+| Terskler og poeng | `SCANNER_CONFIG["early"]` |
+| Features fra OHLCV | `tidlige_features()` |
+| §2 Falling Knife Guard | `falling_knife_guard()` |
+| §3 Turn Score 0-100 | `turn_score()`, grupper A-F |
+| §4 Entry Value 0-100 | `entry_value()` |
+| §5/§7/§8 livssyklus | `vurder_tidlig_lag()` |
+| §10 rangering | `opportunity_score()` |
+
+Presedens: det tidlige laget legges foran WAIT, FOLLOW, CORRECTION og STRONG
+CORRECTION, men aldri foran EVENT RISK, STABILIZING eller REVERSAL. Den
+klassiske statusen er uendret og ligger i `_klassisk_status()`.
+
+Signalet lagres i `radar_state.json` under `lyttepost`, slik at brudd måles mot
+der hypotesen startet og ikke mot dagens bunn. Streamlit Cloud nullstiller
+disken, så et signal kan gå tapt ved omstart.
+
+### Åpent: laget mangler en korreksjonsgate
+
+Spesifikasjonen har ingen gate på severity, og det ble implementert som
+spesifisert. Første kjøring på ekte data 09.09.2026:
+
+| Ticker | Status | Drawdown | Severity | Turn | Entry |
+|---|---|---|---|---|---|
+| DNB | BOTTOM WATCH | 0.6 % | NONE | 42 | 90 |
+| WAWI | BOTTOM WATCH | 0.1 % | NONE | 47 | 65 |
+
+Begge står praktisk talt på topp. De får poeng for momentum, volum og
+SMA20-reclaim — det samme problemet Recovery Score løser med
+`requiresSeverity: CORRECTION` (se §5).
+
+Samtidig var de fem aksjene som faktisk står i korreksjon alle STABILIZING,
+som vinner over laget. Nettoresultatet den dagen var at laget kun lyste på de
+to aksjene uten korreksjon.
+
+Mulig fiks, én linje: `"krevSeverity": SEV_FOLLOW` i `early`, sjekket i
+`vurder_tidlig_lag`. Ikke gjort — venter på Erlends beslutning.
+
 ## 6. Åpne spørsmål som krever ekte data
 
 Disse har stått ubesvart hele veien fordi utviklingsmiljøet manglet nett.
@@ -329,7 +376,7 @@ eller sett gulvet til `False`.
 git pull
 # endre scanner.py
 python -c "import ast; ast.parse(open('scanner.py').read())"
-python test_scanner.py          # skal være 47/47
+python test_scanner.py          # skal være 58/58
 streamlit run scanner.py        # se på den
 git add -A && git commit -m "..." && git push
 ```
