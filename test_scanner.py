@@ -9,6 +9,16 @@ flyselskap forskjellig. Ingen nettverkstilgang kreves.
 """
 
 import copy
+import sys
+
+# Testene skriver ✓ og ✗. Windows-konsollen er cp1252 og kaster
+# UnicodeEncodeError på dem, så «python test_scanner.py» kræsjet uten at
+# PYTHONIOENCODING var satt.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 import numpy as np
 import pandas as pd
 
@@ -1094,6 +1104,31 @@ krav("§R2", "Milepælene plukker første forekomst, ikke siste",
      "BOTTOM WATCH 02.06 · LYTTEPOST 03.06 · BRUTT 05.06 · STABILIZING 08.06\n    "
      "BOTTOM WATCH opptrer to ganger, men første dato rapporteres\n    "
      "REVERSAL inntraff aldri, mens de tekniske kravene var oppfylt 08.06")
+
+
+# ── Én ticker i batchen ──
+# Med group_by="ticker" legger yfinance tickeren på kolonnenivå 0 også når
+# forespørselen gjaldt én aksje. En naiv flating ga da kolonnene
+# ['KIT.OL', 'KIT.OL', ...], serien ble forkastet som for kort historikk, og
+# en watchlist med kun én aktiv aksje ga tom radar.
+
+en_serie = serie_til(date(2026, 9, 7), n=520)
+en_multi = en_serie.copy()
+en_multi.columns = pd.MultiIndex.from_product([["KIT.OL"], en_serie.columns])
+flat_multi = en_serie.copy()
+flat_multi.columns = pd.MultiIndex.from_product([en_serie.columns, ["KIT.OL"]])
+
+valgt = S._velg_ticker(en_multi, "KIT.OL")
+valgt_flat = S._velg_ticker(flat_multi, "KIT.OL")
+krav("§B1", "Én ticker i batchen gir OHLCV-kolonner, ikke tickernavn",
+     list(valgt.columns) == ["Open", "High", "Low", "Close", "Volume"]
+     and list(valgt_flat.columns) == ["Open", "High", "Low", "Close", "Volume"]
+     and S.calculate_indicators(valgt) is not None
+     and list(S._velg_ticker(en_serie, "KIT.OL").columns) == list(en_serie.columns),
+     f"ticker på nivå 0 → {list(valgt.columns)}\n    "
+     f"felt på nivå 0 → {list(valgt_flat.columns)}\n    "
+     f"allerede flat serie står urørt\n    "
+     f"uten dette returnerte calculate_indicators None for hele watchlisten")
 
 
 # ── A: DNB vs NAS ──

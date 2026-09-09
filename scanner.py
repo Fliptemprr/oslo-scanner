@@ -2671,6 +2671,25 @@ def _lag_session():
         return None
 
 
+def _velg_ticker(raw: pd.DataFrame, ticker: str) -> pd.DataFrame:
+    """
+    Hent én tickers OHLCV ut av et yfinance-svar.
+
+    Med group_by="ticker" legger yfinance tickeren på kolonnenivå 0 — også når
+    forespørselen bare gjaldt én ticker. `raw` er da fortsatt MultiIndex, og en
+    naiv flating gir kolonnenavn ['KIT.OL', 'KIT.OL', ...] i stedet for OHLCV.
+    Serien ble dermed forkastet som «for kort historikk», og en watchlist med
+    kun én aktiv aksje ga tom radar.
+    """
+    if isinstance(raw.columns, pd.MultiIndex):
+        if ticker in raw.columns.get_level_values(0):
+            return raw[ticker].copy()
+        d = raw.copy()
+        d.columns = d.columns.get_level_values(0)
+        return d
+    return raw.copy()
+
+
 def _download_batch(batch: list, session, start, end) -> dict:
     """Last ned én batch, returner dict {ticker: df}."""
     result = {}
@@ -2685,7 +2704,7 @@ def _download_batch(batch: list, session, start, end) -> dict:
                 return result
             for t in batch:
                 try:
-                    d = raw.copy() if len(batch) == 1 else raw[t].copy()
+                    d = _velg_ticker(raw, t)
                     d = d.dropna(how="all")
                     if len(d) >= MIN_HISTORY_BARS:
                         result[t] = d
