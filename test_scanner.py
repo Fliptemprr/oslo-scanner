@@ -575,6 +575,141 @@ krav("P0", "Manglende handelsdag påvirker mer enn KURS og % I DAG",
      "derfor er STALE et blokkerende varsel, ikke en fotnote")
 
 
+# ── Header må vise faktisk brukt candle, ikke forventet dato ──
+# Symptom 08.09.2026: header sa «MARKEDSDATA T.O.M. 08.09» mens NOD, KIT og KOG
+# ble beregnet på 07.09-closes. Årsaken var at datastatus brukte max() over
+# tickerne: én fersk serie holdt stale=False for hele skanningen.
+
+blandet = {
+    "KOG.OL": serie_til(date(2026, 9, 7)),          # en dag bak
+    "KIT.OL": serie_til(date(2026, 9, 7), seed=6),  # en dag bak
+    "NOD.OL": serie_til(date(2026, 9, 8), seed=8),  # oppdatert
+}
+etter_close = datetime(2026, 9, 8, 19, 0, tzinfo=OSLO)
+st_blandet = S.datastatus(blandet, etter_close)
+
+krav("P0", "Én oppdatert ticker skjuler ikke at resten ligger bak",
+     st_blandet["stale"] is True
+     and st_blandet["faktisk"] == date(2026, 9, 7)
+     and st_blandet["nyeste"] == date(2026, 9, 8)
+     and set(st_blandet["etterslep"]) == {"KOG.OL", "KIT.OL"},
+     f"forventet {st_blandet['forventet']} · NOD har 08.09, KOG og KIT har 07.09\n    "
+     f"faktisk (svakeste ledd) {st_blandet['faktisk']} · "
+     f"nyeste {st_blandet['nyeste']} · stale={st_blandet['stale']}\n    "
+     f"med max() ville banneret meldt 08.09 mens to av tre ble regnet på 07.09")
+
+alle_ferske = S.datastatus(
+    {t: serie_til(date(2026, 9, 8), seed=i) for i, t in enumerate(blandet)},
+    etter_close)
+krav("P0", "Alle tickere oppdatert gir ikke falskt STALE",
+     alle_ferske["stale"] is False
+     and alle_ferske["faktisk"] == date(2026, 9, 8)
+     and alle_ferske["etterslep"] == {},
+     f"alle tre t.o.m. 08.09 → stale={alle_ferske['stale']}, "
+     f"banner viser {alle_ferske['faktisk']}")
+
+# ── EOD samme kveld: Yahoo publiserer dagsbaren først neste morgen ──
+# Radaren skal brukes etter børsslutt. regularMarketPrice står stille på
+# auksjonens sluttkurs så snart sesjonen er over, mens den er en levende
+# intradagkurs mens børsen er åpen. Derfor må klokkeslettet sjekkes.
+
+def meta_1d(dag, time_, minutt, kurs):
+    stempel = int(datetime(dag.year, dag.month, dag.day, time_, minutt,
+                           tzinfo=OSLO).timestamp())
+    return {"timestamp": [stempel],
+            "meta": {"exchangeTimezoneName": "Europe/Oslo",
+                     "regularMarketPrice": kurs,
+                     "regularMarketTime": stempel,
+                     "chartPreviousClose": None}}
+
+
+D8 = date(2026, 9, 8)
+krav("P0", "Sluttkurs for dagens sesjon godtas kun etter stengetid",
+     S.offisiell_close_i_dag(meta_1d(D8, 17, 5, 301.20), D8, "Europe/Oslo") == 301.20
+     and S.offisiell_close_i_dag(meta_1d(D8, 16, 25, 301.20), D8, "Europe/Oslo") == 301.20
+     and S.offisiell_close_i_dag(meta_1d(D8, 12, 7, 298.70), D8, "Europe/Oslo") is None
+     and S.offisiell_close_i_dag(meta_1d(D8, 17, 5, 301.20), date(2026, 9, 7),
+                                 "Europe/Oslo") is None
+     and S.offisiell_close_i_dag(None, D8, "Europe/Oslo") is None,
+     "17:05 og 16:25 er etter stengetid 16:20 → godtas\n    "
+     "12:07 er midt i sesjonen → avvises, ellers hadde en levende kurs blitt "
+     "lagret som sluttkurs\n    "
+     "kurs fra 08.09 brukes ikke som sluttkurs for 07.09")
+
+# Hele kvelden 08.09: Yahoo mangler både 07.09 (null-bar) og 08.09 (ikke
+# publisert ennå). Begge skal rekonstrueres, med riktig sluttkurs på hver.
+FASIT_07, FASIT_08 = 298.00, 301.20
+_fasit_eod = serie_til(date(2026, 9, 8), seed=4)
+_uten_to = _fasit_eod[~pd.Series(_fasit_eod.index.date, index=_fasit_eod.index)
+                      .isin([date(2026, 9, 7), date(2026, 9, 8)]).to_numpy()]
+
+_ekte_i, _ekte_m = S._hent_intradag, S._hent_dagsmeta
+S._hent_intradag = lambda t, session, cfg=S.SCANNER_CONFIG: falsk_intradag_svar(
+    _fasit_eod, [date(2026, 9, 4), date(2026, 9, 7), date(2026, 9, 8)])
+S._hent_dagsmeta = lambda t, session, cfg=S.SCANNER_CONFIG: {
+    "timestamp": [int(datetime(2026, 9, 8, 17, 5, tzinfo=OSLO).timestamp())],
+    "meta": {"exchangeTimezoneName": "Europe/Oslo",
+             "chartPreviousClose": FASIT_07,
+             "regularMarketPrice": FASIT_08,
+             "regularMarketTime": int(datetime(2026, 9, 8, 17, 5,
+                                               tzinfo=OSLO).timestamp())}}
+try:
+    eod = {"KOG.OL": _uten_to.copy()}
+    eod, eod_fikset = S.backfill_manglende_dager(eod, date(2026, 9, 8), None, {})
+    eod_renset = S.rens_prisdata(eod, etter_close)
+    st_eod = S.datastatus(eod_renset, etter_close)
+finally:
+    S._hent_intradag, S._hent_dagsmeta = _ekte_i, _ekte_m
+
+c7 = float(eod_renset["KOG.OL"].loc[pd.Timestamp("2026-09-07"), "Close"])
+c8 = float(eod_renset["KOG.OL"].loc[pd.Timestamp("2026-09-08"), "Close"])
+krav("P0", "Kveldsskanning rekonstruerer dagens ferdige sesjon fra intradag",
+     eod_fikset == ["KOG.OL"] and not st_eod["stale"]
+     and st_eod["faktisk"] == date(2026, 9, 8)
+     and abs(c7 - FASIT_07) < 1e-6 and abs(c8 - FASIT_08) < 1e-6,
+     f"Yahoo manglet både 07.09 (null-bar) og 08.09 (ikke publisert før neste "
+     f"morgen)\n    "
+     f"rekonstruert: 07.09 close {c7:.2f} fra chartPreviousClose · "
+     f"08.09 close {c8:.2f} fra regularMarketPrice\n    "
+     f"banner viser {st_eod['faktisk']}, stale={st_eod['stale']}")
+
+
+# ── Dager kilden har mistet permanent ──
+# Yahoo droppet 07.09.2026 helt: den kom som null-bar og er nå borte fra
+# dagsserien. Intradag-aggregatet bommer på sluttkursen med inntil 0.3 %,
+# fordi sluttauksjonen 16:20-16:25 ikke ligger i den kontinuerlige feeden.
+# For en dag som verken er i dag eller i går finnes ingen offisiell kilde.
+
+krav("P0", "Manuelt registrert sluttkurs brukes for dager kilden har mistet",
+     S.kjent_sluttkurs("KOG.OL", date(2026, 9, 7)) == 298.00
+     and S.kjent_sluttkurs("KIT.OL", date(2026, 9, 7)) == 98.40
+     and S.kjent_sluttkurs("KOG.OL", date(2026, 9, 4)) is None
+     and S.kjent_sluttkurs("UKJENT.OL", date(2026, 9, 7)) is None,
+     "kursene er lest fra Yahoos egen meta.chartPreviousClose den 08.09\n    "
+     "KOG 298.00 og KIT 98.40 er i tillegg bekreftet manuelt mot markedet")
+
+# Uten offisiell kilde skal baren merkes, ikke presenteres som eksakt
+_ekte_i2, _ekte_m2 = S._hent_intradag, S._hent_dagsmeta
+S._hent_intradag = lambda t, session, cfg=S.SCANNER_CONFIG: falsk_intradag_svar(
+    _fasit_eod, [date(2026, 9, 4), date(2026, 9, 7), date(2026, 9, 8)])
+S._hent_dagsmeta = lambda t, session, cfg=S.SCANNER_CONFIG: None   # ingen meta
+try:
+    uten_off = {"UKJENT.OL": _uten_to.copy()}
+    diag_off = {}
+    uten_off, _ = S.backfill_manglende_dager(uten_off, date(2026, 9, 8), None,
+                                             diag_off)
+finally:
+    S._hent_intradag, S._hent_dagsmeta = _ekte_i2, _ekte_m2
+
+agg8 = float(_fasit_eod.loc[pd.Timestamp("2026-09-08"), "Close"])
+krav("P0", "Bar uten offisiell sluttkurs merkes som omtrentlig",
+     abs(float(uten_off["UKJENT.OL"].loc[pd.Timestamp("2026-09-08"), "Close"])
+         - agg8) < 1e-6
+     and "omtrentlig" in diag_off["UKJENT.OL"]["intradag"],
+     f"ingen meta tilgjengelig → close {agg8:.2f} fra aggregatet\n    "
+     f"diagnose: {diag_off['UKJENT.OL']['intradag']}")
+
+
 # ── Corporate actions: fisjon skal ikke telle som kursfall ──
 # Yahoo justerer for utbytte og splitt, men IKKE for fisjon. KOG falt
 # 398.50 → 328.38 ved åpning 15.04.2026, med 15.04 sin high under 14.04 sin

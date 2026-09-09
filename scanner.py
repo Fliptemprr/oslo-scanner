@@ -225,6 +225,27 @@ SCANNER_CONFIG: dict[str, Any] = {
         # feil. Da er det ærligere å la dagen stå tom og beholde STALE.
         "backfillMinBars": 10,
         "backfillTimeout": 20,
+
+        # Yahoo droppet 07.09.2026 helt: dagen kom som null-bar og er nå borte
+        # fra dagsserien. For en dag som verken er i dag eller i går finnes
+        # ingen offisiell sluttkurs hos kilden — chartPreviousClose dekker
+        # gårsdagen, regularMarketPrice dagens sesjon. Intradag-aggregatet
+        # bommer med inntil 0.3 %, fordi sluttauksjonen 16:20-16:25 ikke ligger
+        # i den kontinuerlige feeden.
+        #
+        # Kursene under er lest fra Yahoos egen meta.chartPreviousClose den
+        # 08.09.2026, altså kildens egen offisielle verdi. KOG 298.00 og KIT
+        # 98.40 er i tillegg bekreftet manuelt mot markedet.
+        #
+        # Nye dager havner normalt ikke her: de fanges automatisk samme kveld
+        # via regularMarketPrice, eller neste morgen via chartPreviousClose.
+        "kjenteSluttkurser": {
+            "2026-09-07": {
+                "KOG.OL": 298.00, "NOD.OL": 172.00, "KIT.OL": 98.40,
+                "PROT.OL": 471.20, "DNB.OL": 320.70, "WAWI.OL": 165.90,
+                "NAS.OL": 12.76,
+            },
+        },
     },
 
     # ── Corporate actions ──
@@ -2141,13 +2162,23 @@ def datastatus(prisdata: dict, naa: Optional[datetime] = None,
     forventet = siste_avsluttede_handelsdag(naa, cfg)
     per_ticker = {t: _bar_dato(df) for t, df in prisdata.items()}
     gyldige = [d for d in per_ticker.values() if d is not None]
-    faktisk = max(gyldige) if gyldige else None
     etterslep = {t: d for t, d in per_ticker.items() if d is not None and d < forventet}
+    mangler_helt = [t for t, d in per_ticker.items() if d is None]
+
+    # Svakeste ledd, ikke det ferskeste. Med max() holdt én oppdatert ticker
+    # stale=False for hele skanningen, og banneret meldte 08.09 mens NOD, KIT
+    # og KOG ble beregnet på 07.09-closes. Headeren skal vise den candlen
+    # analysen faktisk hviler på.
+    faktisk = min(gyldige) if gyldige else None
+    nyeste = max(gyldige) if gyldige else None
 
     return {
         "forventet": forventet,
         "faktisk": faktisk,
-        "stale": bool(faktisk is None or faktisk < forventet),
+        "nyeste": nyeste,
+        "spriker": bool(faktisk is not None and faktisk != nyeste),
+        "stale": bool(not gyldige or etterslep or mangler_helt),
+        "manglerHelt": mangler_helt,
         "etterslep": etterslep,
         "perTicker": per_ticker,
         "kilder": {t: df.attrs.get("sisteKilde", "yahoo")
@@ -2468,6 +2499,50 @@ def offisiell_close(res: Optional[dict], dag: date,
     return kurs if forrige_handelsdag(sesjon) == dag else None
 
 
+def offisiell_close_i_dag(res: Optional[dict], dag: date, tz_standard: str,
+                          cfg: dict = SCANNER_CONFIG) -> Optional[float]:
+    """
+    Offisiell sluttkurs for dagens egen sesjon, etter at børsen har stengt.
+
+    Yahoo publiserer den ferdige dagsbaren først neste handelsmorgen. Det er
+    et problem fordi radaren primært brukes etter børsslutt, til å planlegge
+    neste dag. regularMarketPrice står derimot stille på sluttkursen så snart
+    sesjonen er over.
+
+    Mens børsen er åpen er det samme feltet en levende intradagkurs, og den må
+    aldri lagres som sluttkurs. Derfor godtas den kun når regularMarketTime
+    ligger på `dag` og er etter stengetid.
+    """
+    if not res:
+        return None
+    meta = res.get("meta") or {}
+    kurs = _num(meta.get("regularMarketPrice"))
+    stempel = meta.get("regularMarketTime")
+    if kurs is None or not stempel:
+        return None
+
+    d = cfg["data"]
+    tz = meta.get("exchangeTimezoneName") or tz_standard
+    tidspunkt = (datetime.fromtimestamp(int(stempel), tz=ZoneInfo("UTC"))
+                 .astimezone(ZoneInfo(tz)))
+    if tidspunkt.date() != dag:
+        return None
+    stenger = dtime(d["marketCloseHour"], d["marketCloseMinute"])
+    return kurs if tidspunkt.time() >= stenger else None
+
+
+def kjent_sluttkurs(ticker: str, dag: date,
+                    cfg: dict = SCANNER_CONFIG) -> Optional[float]:
+    """
+    Manuelt registrert offisiell sluttkurs for dager kilden har mistet.
+
+    Siste utvei, etter chartPreviousClose og regularMarketPrice. Se
+    kommentaren i SCANNER_CONFIG for hvor kursene kommer fra.
+    """
+    tabell = cfg["data"].get("kjenteSluttkurser") or {}
+    return _num((tabell.get(dag.isoformat()) or {}).get(ticker))
+
+
 def flett_inn_dagsbar(df: pd.DataFrame, dag: date, bar: dict) -> pd.DataFrame:
     """
     Sett en rekonstruert dagsbar inn i serien uten å røre eksisterende rader.
@@ -2537,12 +2612,18 @@ def backfill_manglende_dager(alle: dict, forventet: date, session,
                     log.warning(f"[{t}] {dag}: kun {bar['_barer']} intradag-barer, "
                                 f"hopper over")
                     continue
-                off = offisiell_close(dagsmeta, dag, tz)
+                # chartPreviousClose dekker gårsdagen, regularMarketPrice
+                # dagens egen sesjon når den er ferdig, og tabellen dager
+                # kilden har mistet helt.
+                off = (offisiell_close(dagsmeta, dag, tz)
+                       or offisiell_close_i_dag(dagsmeta, dag, tz, cfg)
+                       or kjent_sluttkurs(t, dag, cfg))
                 if off is not None:
                     bar = dict(bar, Close=off)
                 alle[t] = flett_inn_dagsbar(alle[t], dag, bar)
                 alle[t].attrs["sisteKilde"] = "yahoo-intradag"
-                lagt_inn.append(f"{dag}{' (offisiell close)' if off else ''}")
+                lagt_inn.append(
+                    f"{dag} ({'offisiell close' if off is not None else 'omtrentlig close'})")
 
             dd["intradag"] = (f"tettet {', '.join(lagt_inn)}" if lagt_inn
                               else f"manglet {dager}, intradag hadde "
@@ -3076,7 +3157,12 @@ def datobanner(status: dict) -> str:
     if not status["stale"]:
         kilder = status.get("kilder", {})
         fra_stooq = sorted(t.replace(".OL", "") for t, k in kilder.items() if k == "stooq")
+        rekonstruert = sorted(t.replace(".OL", "") for t, k in kilder.items()
+                              if k == "yahoo-intradag")
         merke = (f' · SISTE DAG FRA STOOQ: {", ".join(fra_stooq)}' if fra_stooq else "")
+        if rekonstruert:
+            merke += (f' · EOD REKONSTRUERT FRA INTRADAG: '
+                      f'{", ".join(rekonstruert)}')
         return (f'<div style="font-family:{MONO};font-size:10px;letter-spacing:0.1em;'
                 f'color:{DC["svak"]};padding:8px 0 0;">'
                 f'<span style="color:{DC["gronn"]};">●</span> MARKEDSDATA T.O.M. '

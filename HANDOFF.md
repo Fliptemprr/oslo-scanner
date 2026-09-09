@@ -27,7 +27,7 @@ egen historikk av korreksjoner, funnet med ATR-normalisert ZigZag. Et fall på
 | Fil | Innhold |
 |---|---|
 | `scanner.py` | Hele appen, ~3800 linjer. Config → typer → indikatorer → handelskalender → swings → scorer → motor → datahenting → UI |
-| `test_scanner.py` | 41 akseptansetester. Kjøres uten nett, med syntetiske kursserier |
+| `test_scanner.py` | 47 akseptansetester. Kjøres uten nett, med syntetiske kursserier |
 | `sjekk_data.py` | Frittstående diagnose av datakildene. Krever nett |
 | `.streamlit/config.toml` | Mørkt tema |
 | `README.md` | Kort produktbeskrivelse |
@@ -43,7 +43,7 @@ gitignorert. Streamlit Cloud har flyktig disk, så listen faller tilbake til
 1. **Ikke endre trading-logikken** — Correction Score, Trend Score, Recovery
    Score, phase, severity, statusmotoren, event risk — uten at brukeren
    eksplisitt gir nye regler. Masterspesifikasjonen styrer, ikke egne ideer.
-2. **`python test_scanner.py` skal være 41/41 før hver push.** Feiler noe,
+2. **`python test_scanner.py` skal være 47/47 før hver push.** Feiler noe,
    er det enten en reell regresjon eller en dårlig test. Begge må undersøkes,
    ingen av dem ignoreres.
 3. **`python -c "import ast; ast.parse(open('scanner.py').read())"` etter hver
@@ -173,6 +173,51 @@ fisjoneres fra. Dagens kurs står alltid urørt, så UI-et viser faktisk
 markedskurs; detaljpanelet opplyser om justeringen der den historiske toppen
 vises.
 
+## 3c. EOD samme kveld, og en header som ikke lyver — løst 09.09.2026
+
+To feil meldt av Erlend 08.-09.09.
+
+**Headeren viste forventet dato, ikke brukt candle.** `datastatus` brukte
+`max()` over tickerne:
+
+```python
+faktisk = max(gyldige)              # det ferskeste
+stale   = faktisk < forventet
+```
+
+Én oppdatert ticker holdt `stale=False` for hele skanningen. Banneret meldte
+«MARKEDSDATA T.O.M. 08.09» mens NOD, KIT og KOG ble beregnet på 07.09-closes.
+Nå er `faktisk` **svakeste ledd** (`min`), `nyeste` er tatt vare på for
+diagnose, og `stale` er sann så snart *én* ticker ligger bak.
+
+**Yahoo publiserer dagsbaren først neste handelsmorgen.** Det er kritisk, siden
+radaren primært brukes etter børsslutt for å planlegge neste dag. Rekkefølgen
+for sluttkurs på en rekonstruert dag er nå:
+
+| Kilde | Dekker |
+|---|---|
+| `chartPreviousClose` | gårsdagen (sesjonen før svarets egen) |
+| `regularMarketPrice` | dagens sesjon, kun når `regularMarketTime` er etter 16:20 |
+| `kjenteSluttkurser` | dager kilden har mistet helt |
+| intradag-aggregatet | siste utvei, merkes «omtrentlig close» |
+
+Klokkeslettsjekken er ufravikelig: mens børsen er åpen er `regularMarketPrice`
+en levende intradagkurs, og den må aldri lagres som sluttkurs. Scores beregnes
+fortsatt kun på avsluttede sesjoner.
+
+**07.09.2026 er tapt hos Yahoo.** Dagen kom som null-bar og er nå helt borte
+fra dagsserien. Den rekonstrueres fra intradag, men sluttauksjonen 16:20-16:25
+ligger ikke i den kontinuerlige feeden, så aggregatet bommet med opptil 0.3 %
+— nok til at `% I DAG` for 08.09 ble synlig feil. `kjenteSluttkurser` i
+config holder de sju offisielle kursene, lest fra Yahoos egen
+`meta.chartPreviousClose` den 08.09.
+
+**Åpen begrensning:** 5-minutters historikk hos Yahoo rekker bare rundt en
+måned. Rekonstruksjonen av 07.09 forsvinner derfor tidlig i oktober, og da vil
+serien mangle dagen permanent. `kjenteSluttkurser` alene tetter ikke det —
+den gir close, ikke OHLCV. Vurder å skrive rekonstruerte barer til disk, eller
+å bytte til en kilde med ekte EOD-historikk, før det inntreffer.
+
 ## 4. Datahentingens arkitektur
 
 Kjeden i `hent_prisdata()`:
@@ -284,7 +329,7 @@ eller sett gulvet til `False`.
 git pull
 # endre scanner.py
 python -c "import ast; ast.parse(open('scanner.py').read())"
-python test_scanner.py          # skal være 41/41
+python test_scanner.py          # skal være 47/47
 streamlit run scanner.py        # se på den
 git add -A && git commit -m "..." && git push
 ```
