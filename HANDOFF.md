@@ -27,8 +27,9 @@ egen historikk av korreksjoner, funnet med ATR-normalisert ZigZag. Et fall på
 | Fil | Innhold |
 |---|---|
 | `scanner.py` | Hele appen, ~3800 linjer. Config → typer → indikatorer → handelskalender → swings → scorer → motor → datahenting → UI |
-| `test_scanner.py` | 58 akseptansetester. Kjøres uten nett, med syntetiske kursserier |
+| `test_scanner.py` | 60 akseptansetester. Kjøres uten nett, med syntetiske kursserier |
 | `sjekk_data.py` | Frittstående diagnose av datakildene. Krever nett |
+| `replay.py` | Historisk replay av det tidlige laget. Krever nett |
 | `.streamlit/config.toml` | Mørkt tema |
 | `README.md` | Kort produktbeskrivelse |
 
@@ -43,7 +44,7 @@ gitignorert. Streamlit Cloud har flyktig disk, så listen faller tilbake til
 1. **Ikke endre trading-logikken** — Correction Score, Trend Score, Recovery
    Score, phase, severity, statusmotoren, event risk — uten at brukeren
    eksplisitt gir nye regler. Masterspesifikasjonen styrer, ikke egne ideer.
-2. **`python test_scanner.py` skal være 58/58 før hver push.** Feiler noe,
+2. **`python test_scanner.py` skal være 60/60 før hver push.** Feiler noe,
    er det enten en reell regresjon eller en dårlig test. Begge må undersøkes,
    ingen av dem ignoreres.
 3. **`python -c "import ast; ast.parse(open('scanner.py').read())"` etter hver
@@ -376,7 +377,7 @@ eller sett gulvet til `False`.
 git pull
 # endre scanner.py
 python -c "import ast; ast.parse(open('scanner.py').read())"
-python test_scanner.py          # skal være 58/58
+python test_scanner.py          # skal være 60/60
 streamlit run scanner.py        # se på den
 git add -A && git commit -m "..." && git push
 ```

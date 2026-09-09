@@ -1039,6 +1039,63 @@ krav("§T10", "LYTTEPOST viker for STABILIZING, REVERSAL og EVENT RISK",
      "uten tidlig lag er statusen nøyaktig som før")
 
 
+# ── Historisk replay ──
+# Hele poenget med et replay er at det ikke jukser. Kutter vi bort de siste
+# dagene, skal de foregående radene være bit for bit identiske — ellers har
+# fremtidige barer lekket inn i fortiden.
+
+rep_df = paalegg_fall(lag_df(n=600, sigma=1.8, drift=0.04, seed=12), 18, 60)
+rep_df.index = pd.bdate_range(end=pd.Timestamp("2026-09-09"), periods=600)
+
+rep_full = S.replay_ticker("TEST.OL", rep_df, dager=12)
+rep_kort = S.replay_ticker("TEST.OL", rep_df.iloc[:-4], dager=8)
+
+felles = {r["dato"]: r for r in rep_full}
+avvik = []
+for r in rep_kort:
+    f = felles.get(r["dato"])
+    if f is None:
+        avvik.append((r["dato"], "mangler i full replay"))
+        continue
+    for felt in ("kurs", "turnScore", "entryValue", "opportunityScore",
+                 "status", "correctionScore", "trendScore", "recoveryScore"):
+        if r[felt] != f[felt]:
+            avvik.append((r["dato"], f"{felt}: {r[felt]} vs {f[felt]}"))
+
+krav("§R1", "Replay har ingen look-ahead — fremtidige barer endrer ikke fortiden",
+     not avvik and len(rep_kort) >= 5
+     and all(r["kurs"] == float(rep_df.loc[pd.Timestamp(r["dato"]), "Close"])
+             for r in rep_full),
+     f"{len(rep_full)} dager replayet, {len(rep_kort)} med fire dager kuttet "
+     f"bort\n    "
+     f"{len(rep_kort)} overlappende datoer sammenlignet på kurs, Turn, Entry, "
+     f"Opportunity,\n    status og alle tre scorene: "
+     f"{'ingen avvik' if not avvik else avvik[:3]}\n    "
+     f"hver rad bruker close fra sin egen dag")
+
+# Tilstand skal bæres videre mellom dagene, ellers kan verken decay eller
+# LYTTEPOST BRUTT inntreffe — begge måles mot lagret signal.
+rep_rader = [
+    {"dato": date(2026, 6, 1), "status": S.STATUS_WAIT, "reversalTeknisk": False},
+    {"dato": date(2026, 6, 2), "status": S.STATUS_BOTTOM_WATCH, "reversalTeknisk": False},
+    {"dato": date(2026, 6, 3), "status": S.STATUS_LYTTEPOST, "reversalTeknisk": False},
+    {"dato": date(2026, 6, 4), "status": S.STATUS_BOTTOM_WATCH, "reversalTeknisk": False},
+    {"dato": date(2026, 6, 5), "status": S.STATUS_LYTTEPOST_BRUTT, "reversalTeknisk": False},
+    {"dato": date(2026, 6, 8), "status": S.STATUS_STABILIZING, "reversalTeknisk": True},
+]
+mp = S.replay_milepaeler(rep_rader)
+krav("§R2", "Milepælene plukker første forekomst, ikke siste",
+     mp[S.STATUS_BOTTOM_WATCH]["dato"] == date(2026, 6, 2)
+     and mp[S.STATUS_LYTTEPOST]["dato"] == date(2026, 6, 3)
+     and mp[S.STATUS_LYTTEPOST_BRUTT]["dato"] == date(2026, 6, 5)
+     and mp[S.STATUS_STABILIZING]["dato"] == date(2026, 6, 8)
+     and mp[S.STATUS_REVERSAL] is None
+     and mp["REVERSAL_TEKNISK"]["dato"] == date(2026, 6, 8),
+     "BOTTOM WATCH 02.06 · LYTTEPOST 03.06 · BRUTT 05.06 · STABILIZING 08.06\n    "
+     "BOTTOM WATCH opptrer to ganger, men første dato rapporteres\n    "
+     "REVERSAL inntraff aldri, mens de tekniske kravene var oppfylt 08.06")
+
+
 # ── A: DNB vs NAS ──
 FALL = 7.0
 res = {t: scan(t, paalegg_fall(lag_df(**p), FALL, 18))

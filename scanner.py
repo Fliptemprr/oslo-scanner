@@ -1872,6 +1872,25 @@ def opportunity_score(turn: float, entry: float,
                  + e["opportunityEntryVekt"] * entry, 1)
 
 
+# §9: de seks tegnene brukeren skal kunne lese av. Fire er hele grupper fra
+# Turn Score, to er enkeltkriterier som er lette å kjenne igjen på grafen.
+# UI-et og replayet teller de samme seks.
+TIDLIG_SIGNALER = [
+    ("gruppe", "A"), ("gruppe", "B"), ("gruppe", "C"), ("gruppe", "D"),
+    ("kriterium", "higherLow"), ("kriterium", "sma20Reclaim"),
+]
+
+
+def tidlige_signaler(e: dict) -> tuple:
+    """(antall aktive, totalt, {nøkkel: truffet}) for de seks tegnene."""
+    grupper, kriterier = e.get("grupper", {}), e.get("kriterier", {})
+    truffet = {}
+    for slag, nokkel in TIDLIG_SIGNALER:
+        truffet[nokkel] = (grupper.get(nokkel, 0) > 0 if slag == "gruppe"
+                           else bool(kriterier.get(nokkel)))
+    return sum(truffet.values()), len(TIDLIG_SIGNALER), truffet
+
+
 def vurder_tidlig_lag(ind: dict, cc: Optional["CorrectionEvent"],
                       lagret: Optional[dict] = None,
                       cfg: dict = SCANNER_CONFIG) -> dict:
@@ -3271,6 +3290,116 @@ def kjor_scan(prisdata: dict, fund_store: dict, state: Optional[dict] = None,
 
 
 # ══════════════════════════════════════════════════════════════
+# HISTORISK REPLAY
+#
+# Rent diagnostikkverktøy for kalibrering. Rører verken scoring,
+# terskler eller statuslogikk — det er samme motor, kjørt dag for
+# dag gjennom historikken.
+# ══════════════════════════════════════════════════════════════
+
+def _korreksjonstilstand(cc) -> dict:
+    """Tilstanden som bæres videre til neste dag, samme form som i state."""
+    return {
+        "correctionId": cc.correctionId,
+        "maxDrawdownPct": cc.maxDrawdownPct,
+        "severity": cc.severity,
+        "phase": cc.phase,
+        "peakDate": cc.peakDate,
+        "troughDate": cc.troughDate,
+    }
+
+
+def replay_ticker(ticker: str, df: pd.DataFrame, dager: int = 252,
+                  fund_store: Optional[dict] = None,
+                  cfg: dict = SCANNER_CONFIG) -> list:
+    """
+    Kjør motoren dag for dag gjennom historikken. Én rad per handelsdag.
+
+    Hver dag ser KUN barer til og med den dagen — `df.iloc[:i + 1]`. Ingen
+    look-ahead, verken i indikatorer, swings eller percentiler.
+
+    Korreksjonstilstand og lyttepost-signal bæres videre fra dag til dag,
+    akkurat som mellom to skanninger i appen. Uten det ville verken decay
+    eller LYTTEPOST BRUTT kunne inntreffe, siden begge måles mot lagret
+    tilstand og ikke mot dagens tall alene.
+
+    Fundamental godkjenning finnes ikke i historikk. REVERSAL krever den, så
+    den vil normalt aldri utløses i et replay. `reversalTeknisk` viser i
+    stedet dagene der alle de tekniske kravene var oppfylt.
+    """
+    if df is None or len(df) <= MIN_HISTORY_BARS:
+        return []
+
+    n = len(df)
+    start = max(MIN_HISTORY_BARS, n - dager)
+    korreksjon, lyttepost = None, None
+    rader = []
+
+    for i in range(start, n):
+        vindu = df.iloc[:i + 1]
+        try:
+            r = scan_stock(ticker, vindu, fund_store or {}, korreksjon, cfg,
+                           lyttepost)
+        except Exception as e:
+            log.warning(f"[{ticker}] replay {vindu.index[-1].date()} feilet: "
+                        f"{type(e).__name__}: {e}")
+            continue
+        if r is None:
+            continue
+
+        e_lag = r.get("early") or {}
+        f = e_lag.get("features") or {}
+        cc = r.get("currentCorrection")
+        aktive, totalt, _ = tidlige_signaler(e_lag)
+
+        rader.append({
+            "dato": vindu.index[-1].date(),
+            "kurs": r["ind"]["close_now"],
+            "drawdownFraTopp": cc.currentDrawdownPct if cc else None,
+            "fraLokalBunn": f.get("distanceFromLowPct"),
+            "turnScore": e_lag.get("turnScore"),
+            "entryValue": e_lag.get("entryValue"),
+            "opportunityScore": e_lag.get("opportunityScore"),
+            "aktiveSignaler": f"{aktive}/{totalt}",
+            "status": r["status"],
+            "klassisk": _klassisk_status(r, cfg),
+            "tidligStatus": e_lag.get("status"),
+            "styrke": e_lag.get("styrke"),
+            "fallingKnife": e_lag.get("fallingKnife", False),
+            "correctionScore": r["correctionScore"],
+            "trendScore": r["trendScore"],
+            "recoveryScore": r["recoveryScore"],
+            "reversalTeknisk": reversal_blokkert(r, cfg),
+            "grupper": dict(e_lag.get("grupper", {})),
+        })
+
+        # Bæres videre, som mellom to skanninger
+        korreksjon = _korreksjonstilstand(cc) if cc is not None else None
+        lyttepost = e_lag.get("tilstand") or None
+
+    return rader
+
+
+REPLAY_MILEPAELER = [
+    (STATUS_BOTTOM_WATCH, "BOTTOM WATCH utløses"),
+    (STATUS_LYTTEPOST, "LYTTEPOST utløses"),
+    (STATUS_LYTTEPOST_BRUTT, "LYTTEPOST brytes"),
+    (STATUS_STABILIZING, "STABILIZING utløses"),
+    (STATUS_REVERSAL, "REVERSAL utløses"),
+]
+
+
+def replay_milepaeler(rader: list) -> dict:
+    """Første dag hver status inntreffer, pluss teknisk REVERSAL."""
+    ut = {}
+    for status, _ in REPLAY_MILEPAELER:
+        treff = next((r for r in rader if r["status"] == status), None)
+        ut[status] = treff
+    ut["REVERSAL_TEKNISK"] = next((r for r in rader if r["reversalTeknisk"]), None)
+    return ut
+
+
+# ══════════════════════════════════════════════════════════════
 # DESIGN TOKENS – fra mockupen «1a TERMINAL»
 # ══════════════════════════════════════════════════════════════
 
@@ -4021,14 +4150,14 @@ def kriterieliste_html(tittel: str, score: float, deler: dict,
 # §9: de seks tegnene brukeren skal kunne lese av. Fire av dem er hele
 # grupper fra Turn Score, to er enkeltkriterier som er lette å kjenne igjen
 # på grafen. Scanneren skal være forklarbar.
-TIDLIG_ETIKETTER = [
-    ("gruppe", "A", "Fallmomentum avtar", "Fallmomentum avtar ikke"),
-    ("gruppe", "B", "Bunnreaksjon", "Ingen bunnreaksjon"),
-    ("gruppe", "C", "Kort momentum positivt", "Kort momentum ikke positivt"),
-    ("gruppe", "D", "Volumstøtte", "Ingen volumstøtte"),
-    ("kriterium", "higherLow", "Higher low etablert", "Higher low ikke etablert"),
-    ("kriterium", "sma20Reclaim", "SMA20 reclaimet", "SMA20 ikke reclaimet"),
-]
+TIDLIG_TEKST = {
+    "A": ("Fallmomentum avtar", "Fallmomentum avtar ikke"),
+    "B": ("Bunnreaksjon", "Ingen bunnreaksjon"),
+    "C": ("Kort momentum positivt", "Kort momentum ikke positivt"),
+    "D": ("Volumstøtte", "Ingen volumstøtte"),
+    "higherLow": ("Higher low etablert", "Higher low ikke etablert"),
+    "sma20Reclaim": ("SMA20 reclaimet", "SMA20 ikke reclaimet"),
+}
 
 
 def tidlig_html(r: dict) -> str:
@@ -4037,12 +4166,11 @@ def tidlig_html(r: dict) -> str:
     if not e.get("turnScore") and not e.get("aktiv"):
         return ""
 
-    grupper, kriterier = e.get("grupper", {}), e.get("kriterier", {})
-    rader, aktive = [], 0
-    for slag, nokkel, ja, nei in TIDLIG_ETIKETTER:
-        truffet = (grupper.get(nokkel, 0) > 0 if slag == "gruppe"
-                   else bool(kriterier.get(nokkel)))
-        aktive += int(truffet)
+    aktive, totalt, truffet_av = tidlige_signaler(e)
+    rader = []
+    for _, nokkel in TIDLIG_SIGNALER:
+        ja, nei = TIDLIG_TEKST[nokkel]
+        truffet = truffet_av[nokkel]
         rader.append(
             f'<div style="display:flex;gap:8px;align-items:center;padding:4px 0;'
             f'font-size:12px;color:{DC["dempet"] if truffet else DC["svakest"]};">'
@@ -4080,7 +4208,7 @@ def tidlig_html(r: dict) -> str:
         f'{e.get("opportunityScore", 0):.0f}</b></span></div>'
         + "".join(rader)
         + f'<div style="margin-top:6px;font-family:{MONO};font-size:11px;'
-          f'color:{DC["svak"]};">{aktive}/6 tidlige signaler aktive</div>'
+          f'color:{DC["svak"]};">{aktive}/{totalt} tidlige signaler aktive</div>'
         + sperre
         + f'<div style="margin-top:8px;font-size:11px;color:{DC["svakest"]};'
           f'line-height:1.5;">Det tidlige laget kommer før full '
