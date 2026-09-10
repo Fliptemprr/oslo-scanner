@@ -4694,8 +4694,12 @@ def _kildediagnose(diag: dict, dstatus: dict) -> None:
             "Yahoo period": d.get("yahooPeriod", "—"),
             "Stooq": d.get("stooq", "—"),
             "Intradag": d.get("intradag", "—"),
+            # «endelig» settes i hent_prisdata, altså FØR rens_prisdata
+            # forkaster dagens uferdige bar. Den er derfor rå siste bar fra
+            # kilden, ikke baren analysen hviler på. Kolonnen het «Brukt» og
+            # motsa latest_bar_date i samme rad.
+            "Rå siste bar": d.get("endelig", "—"),
             "latest_bar_date": str(dstatus.get("perTicker", {}).get(t, "—")),
-            "Brukt": d.get("endelig", "—"),
         })
     if not rader:
         return
@@ -4710,6 +4714,13 @@ def _kildediagnose(diag: dict, dstatus: dict) -> None:
             "«Yahoo period» den korte, «Stooq» andrekilden (av som "
             "standard), «Intradag» rekonstruksjon av dager Yahoo leverte "
             "som null-barer."
+        )
+        st.caption(
+            "«Rå siste bar» er det kilden leverte, inkludert dagens "
+            "uferdige sesjon. «latest_bar_date» er baren analysen faktisk "
+            "er regnet på — kurs, dagsendring, drawdown, scorer, status og "
+            "graf leser alle fra den. Er de to ulike, er differansen "
+            "dagens halve dag, som forkastes med vilje."
         )
         st.dataframe(pd.DataFrame(rader), width="stretch", hide_index=True,
                      height=min(len(rader) * 36 + 40, 400))
