@@ -1131,6 +1131,75 @@ krav("§B1", "Én ticker i batchen gir OHLCV-kolonner, ikke tickernavn",
      f"uten dette returnerte calculate_indicators None for hele watchlisten")
 
 
+# ── Alt i én rad skal komme fra samme bar ──
+# Symptom 10.09.2026: kurs og dagsendring så ut som tirsdagens tall mens
+# headeren viste onsdag. Innenfor én ticker er blanding strukturelt umulig —
+# kurs, dagsendring, drawdown, scorer, status og grafens siste punkt leser
+# alle fra samme `ind`, altså samme df. Denne testen binder det fast.
+
+kons_df = paalegg_fall(lag_df(n=600, sigma=1.6, drift=0.04, seed=21), 16, 45)
+kons_df.index = pd.bdate_range(end=pd.Timestamp("2026-09-09"), periods=600)
+kons = scan("KONS.OL", kons_df)
+
+siste_dato = kons_df.index[-1].date()
+siste_close = float(kons_df["Close"].iloc[-1])
+forrige_close = float(kons_df["Close"].iloc[-2])
+fasit_1d = (siste_close / forrige_close - 1) * 100
+
+kons_ind = kons["ind"]
+kons_e = kons["early"]
+kons_f = kons_e["features"]
+
+feil = []
+if kons["dataDato"] != siste_dato:
+    feil.append(f"dataDato {kons['dataDato']}")
+if abs(kons_ind["close_now"] - siste_close) > 1e-9:
+    feil.append(f"kurs {kons_ind['close_now']}")
+if abs(kons_ind["return1d"] - fasit_1d) > 0.02:
+    feil.append(f"% i dag {kons_ind['return1d']} mot {fasit_1d}")
+# currentPrice lagres med round(..., 4), så toleransen må matche feltets
+# egen presisjon — ikke maskinepsilon.
+if abs(kons["currentCorrection"].currentPrice - siste_close) > 1e-4:
+    feil.append(f"korreksjonens currentPrice "
+                f"{kons['currentCorrection'].currentPrice} mot {siste_close}")
+if abs(kons_f["kurs"] - siste_close) > 1e-9:
+    feil.append("Turn/Entry-features")
+if kons_ind["index"][-1].date() != siste_dato:
+    feil.append("grafens siste punkt")
+if abs(float(kons_ind["close"].iloc[-1]) - siste_close) > 1e-9:
+    feil.append("grafens kursserie")
+if kons_ind["lastDate"].date() != siste_dato:
+    feil.append("ind.lastDate")
+
+krav("§D1", "Kurs, dagsendring, drawdown, scorer, status og graf leser samme bar",
+     not feil,
+     f"siste bar {siste_dato} · close {siste_close:.2f} · "
+     f"% i dag {fasit_1d:+.2f}\n    "
+     f"dataDato {kons['dataDato']} · ind.close_now {kons_ind['close_now']:.2f} · "
+     f"ind.return1d {kons_ind['return1d']:+.2f} %\n    "
+     f"correctionEvent.currentPrice "
+     f"{kons['currentCorrection'].currentPrice:.2f} · "
+     f"Turn/Entry-kurs {kons_f['kurs']:.2f} · "
+     f"grafens siste punkt {kons_ind['index'][-1].date()}\n    "
+     f"Turn {kons_e['turnScore']} · Entry {kons_e['entryValue']} · "
+     f"Opportunity {kons_e['opportunityScore']} · status {kons['status']}"
+     + (f"\n    AVVIK: {feil}" if feil else ""))
+
+# En uferdig bar fra neste dag skal ikke lekke inn i noe av dette
+kons_med_uferdig = {"KONS.OL": serie_til(date(2026, 9, 10))}
+kons_renset = S.rens_prisdata(kons_med_uferdig,
+                              datetime(2026, 9, 10, 12, 0, tzinfo=OSLO))
+kons_r2 = scan("KONS.OL", kons_renset["KONS.OL"])
+krav("§D2", "Uferdig bar påvirker verken kurs, scorer eller dataDato",
+     kons_r2["dataDato"] == date(2026, 9, 9)
+     and abs(kons_r2["ind"]["close_now"]
+             - float(kons_renset["KONS.OL"]["Close"].iloc[-1])) < 1e-9
+     and kons_r2["ind"]["lastDate"].date() == date(2026, 9, 9),
+     f"serie t.o.m. 10.09 skannet midt i sesjonen → dataDato "
+     f"{kons_r2['dataDato']}\n    "
+     f"alle scorer regnet på siste avsluttede sesjon, ikke på den halve dagen")
+
+
 # ── A: DNB vs NAS ──
 FALL = 7.0
 res = {t: scan(t, paalegg_fall(lag_df(**p), FALL, 18))

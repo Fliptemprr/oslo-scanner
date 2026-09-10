@@ -225,6 +225,12 @@ SCANNER_CONFIG: dict[str, Any] = {
         # feil. Da er det ærligere å la dagen stå tom og beholde STALE.
         "backfillMinBars": 10,
         "backfillTimeout": 20,
+        # Backfillen er kritisk: Yahoo trekker gårsdagens dagsbar tilbake om
+        # morgenen, så den er da eneste kilde til siste avsluttede handelsdag.
+        # Feiler kallet — typisk rate limit fra Streamlit Clouds delte IP-er —
+        # blir hele skanningen stående på forrige dag. Ett ekstra forsøk.
+        "backfillRetry": 1,
+        "backfillRetryDelay": 2,
 
         # Yahoo droppet 07.09.2026 helt: dagen kom som null-bar og er nå borte
         # fra dagsserien. For en dag som verken er i dag eller i går finnes
@@ -2128,6 +2134,13 @@ def scan_stock(ticker: str, df: pd.DataFrame, fund_store: dict,
     resultat = {
         "ticker": ticker,
         "Ticker": ticker.replace(".OL", ""),
+        # Hvilken bar hele raden er regnet på. Kurs, dagsendring, drawdown,
+        # scorer, status og grafens siste punkt kommer alle fra samme `ind`,
+        # altså samme df — så innenfor én ticker kan 08.09 og 09.09 ikke
+        # blandes. Datoen gjøres synlig så det kan verifiseres, og så et
+        # sprik MELLOM tickere oppdages med én gang.
+        "dataDato": ind["lastDate"].date() if hasattr(ind["lastDate"], "date")
+        else ind["lastDate"],
         "early": tidlig,
         "Navn": OSLO_TICKERS.get(ticker, ticker),
         "correctionScore": correction_score,
@@ -2885,7 +2898,16 @@ def _hent_chart(ticker: str, session, rekkevidde: str, intervall: str,
     """Rått svar fra Yahoos chart-API."""
     url = YAHOO_CHART_URL.format(ticker=ticker, rekkevidde=rekkevidde,
                                  intervall=intervall)
-    tekst = _hent_url(url, session, cfg["data"]["backfillTimeout"])
+    d = cfg["data"]
+    tekst = None
+    for forsok in range(d.get("backfillRetry", 0) + 1):
+        tekst = _hent_url(url, session, d["backfillTimeout"])
+        if tekst:
+            break
+        if forsok < d.get("backfillRetry", 0):
+            log.info(f"[{ticker}] chart {rekkevidde}/{intervall} ga ingen "
+                     f"respons, prøver igjen")
+            time.sleep(d.get("backfillRetryDelay", 2))
     if not tekst:
         return None
     try:
@@ -3871,6 +3893,7 @@ def tabell_rader(resultater: list) -> pd.DataFrame:
         rader.append({
             "": "▌",                       # statusspine
             "TICKER": r["Ticker"],
+            "DATO": r["dataDato"].strftime("%d.%m"),
             "FASE": fase,
             "STATUS": status,
             "CORR": r["correctionScore"],
@@ -4123,6 +4146,8 @@ def panel_topp_html(r: dict) -> str:
       {f(ind['close_now'])}</span>
     <span style="font-family:{MONO};font-size:13px;color:{d1f};">
       {f(d1, 2, ' %')}</span>
+    <span style="font-family:{MONO};font-size:10px;color:{DC['svakest']};">
+      EOD {r['dataDato'].strftime('%d.%m.%Y')}</span>
     <span style="flex:1;"></span>
     <span style="font-family:{MONO};font-size:13px;color:{DC['gul']};">
       {f'-{f(cc.currentDrawdownPct, 1)} % fra topp' if cc else '—'}</span>
@@ -4669,6 +4694,7 @@ def _kildediagnose(diag: dict, dstatus: dict) -> None:
             "Yahoo period": d.get("yahooPeriod", "—"),
             "Stooq": d.get("stooq", "—"),
             "Intradag": d.get("intradag", "—"),
+            "latest_bar_date": str(dstatus.get("perTicker", {}).get(t, "—")),
             "Brukt": d.get("endelig", "—"),
         })
     if not rader:
@@ -4685,6 +4711,16 @@ def _kildediagnose(diag: dict, dstatus: dict) -> None:
         )
         st.dataframe(pd.DataFrame(rader), width="stretch", hide_index=True,
                      height=min(len(rader) * 36 + 40, 400))
+
+        # Sprik mellom tickere er den eneste måten 08.09 og 09.09 kan opptre i
+        # samme skanning. Da skal det stå med rene ord.
+        if dstatus.get("spriker"):
+            bak = ", ".join(f"{t.replace('.OL', '')} {d}"
+                            for t, d in sorted(dstatus["etterslep"].items()))
+            st.warning(
+                f"Tickerne står på ulike barer: nyeste er {dstatus['nyeste']}, "
+                f"men disse ligger bak — {bak}. Analysen er merket STALE og "
+                f"skal ikke sammenlignes på tvers.")
 
         st.caption("Test én ticker direkte mot begge kilder:")
         c = st.columns([2, 1])
