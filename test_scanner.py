@@ -1200,6 +1200,39 @@ krav("§D2", "Uferdig bar påvirker verken kurs, scorer eller dataDato",
      f"alle scorer regnet på siste avsluttede sesjon, ikke på den halve dagen")
 
 
+# ── Korreksjonsepisoder som fasit til replay-analysen ──
+# Toppene og bunnene finnes på hele serien, altså med etterpåklokskap. Det er
+# nettopp det som gjør dem til en fasit å måle replayet mot — modellen selv
+# ser fortsatt bare data til og med hver enkelt dag.
+
+ep_df = paalegg_fall(lag_df(n=600, sigma=1.8, drift=0.04, seed=31), 22, 55)
+ep_df.index = pd.bdate_range(end=pd.Timestamp("2026-09-09"), periods=600)
+episoder = S.korreksjonsepisoder("EP.OL", ep_df)
+
+sortert = [e["troughDate"] for e in episoder] == sorted(
+    e["troughDate"] for e in episoder)
+formriktig = all(
+    e["peakDate"] < e["troughDate"]
+    and e["peakPrice"] > e["troughPrice"]
+    and abs((1 - e["troughPrice"] / e["peakPrice"]) * 100 - e["drawdownPct"]) < 0.6
+    # Den aktive korreksjonen lagrer peakPrice med round(..., 4), så
+    # toleransen må matche feltets presisjon.
+    and abs(e["peakPrice"]
+            - float(ep_df.loc[pd.Timestamp(e["peakDate"]), "Close"])) < 1e-3
+    for e in episoder)
+aktive = [e for e in episoder if e["aktiv"]]
+
+krav("§E1", "Korreksjonsepisoder gir topp, bunn og dybde som henger sammen",
+     len(episoder) >= 2 and sortert and formriktig and len(aktive) == 1
+     and aktive[0]["troughDate"] >= episoder[0]["troughDate"],
+     f"{len(episoder)} episoder funnet, sortert på bunndato\n    "
+     f"dypeste: -{max(e['drawdownPct'] for e in episoder):.1f} % · "
+     f"grunneste: -{min(e['drawdownPct'] for e in episoder):.1f} %\n    "
+     f"kursene slås opp i serien, og dybden stemmer med topp og bunn\n    "
+     f"nøyaktig én episode er merket aktiv: "
+     f"{aktive[0]['peakDate']} → {aktive[0]['troughDate']}")
+
+
 # ── A: DNB vs NAS ──
 FALL = 7.0
 res = {t: scan(t, paalegg_fall(lag_df(**p), FALL, 18))

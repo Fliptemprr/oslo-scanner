@@ -3391,7 +3391,7 @@ def replay_ticker(ticker: str, df: pd.DataFrame, dager: int = 252,
         e_lag = r.get("early") or {}
         f = e_lag.get("features") or {}
         cc = r.get("currentCorrection")
-        aktive, totalt, _ = tidlige_signaler(e_lag)
+        aktive, totalt, truffet = tidlige_signaler(e_lag)
 
         rader.append({
             "dato": vindu.index[-1].date(),
@@ -3402,6 +3402,8 @@ def replay_ticker(ticker: str, df: pd.DataFrame, dager: int = 252,
             "entryValue": e_lag.get("entryValue"),
             "opportunityScore": e_lag.get("opportunityScore"),
             "aktiveSignaler": f"{aktive}/{totalt}",
+            "antallSignaler": aktive,
+            "signaler": dict(truffet),
             "status": r["status"],
             "klassisk": _klassisk_status(r, cfg),
             "tidligStatus": e_lag.get("status"),
@@ -3419,6 +3421,53 @@ def replay_ticker(ticker: str, df: pd.DataFrame, dager: int = 252,
         lyttepost = e_lag.get("tilstand") or None
 
     return rader
+
+
+def korreksjonsepisoder(ticker: str, df: pd.DataFrame,
+                        cfg: dict = SCANNER_CONFIG) -> list:
+    """
+    Alle registrerte korreksjoner for en aksje: topp, bunn og dybde.
+
+    Brukes til å ANKRE replay-analysen, ikke som input til modellen. Toppene
+    og bunnene finnes på hele serien, altså med etterpåklokskap — det er
+    nettopp det som gjør dem til en fasit å måle mot. Selve modellen kjøres
+    fortsatt dag for dag uten look-ahead i replay_ticker().
+    """
+    ind = calculate_indicators(df)
+    if ind is None:
+        return []
+
+    swing = detect_swings(ind["close"], ind["atr_s"], cfg["swing"]["atrMultiplier"])
+    close = ind["close"]
+
+    def kurs_paa(datotekst):
+        try:
+            return float(close.loc[pd.Timestamp(datotekst)])
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    ut = []
+    for h in detect_historical_corrections(ticker, ind["atr_s"], swing, cfg):
+        topp, bunn = kurs_paa(h.peakDate), kurs_paa(h.troughDate)
+        if topp is None or bunn is None:
+            continue
+        ut.append({
+            "peakDate": h.peakDate, "peakPrice": topp,
+            "troughDate": h.troughDate, "troughPrice": bunn,
+            "drawdownPct": h.drawdownPct, "dager": h.durationDays,
+            "aktiv": False,
+        })
+
+    cc = detect_current_correction(ticker, ind, swing, None, cfg)
+    if cc is not None and cc.maxDrawdownPct >= cfg["correction"]["minDepthPct"]:
+        ut.append({
+            "peakDate": cc.peakDate, "peakPrice": cc.peakPrice,
+            "troughDate": cc.troughDate, "troughPrice": cc.troughPrice,
+            "drawdownPct": cc.maxDrawdownPct, "dager": cc.daysPeakToTrough,
+            "aktiv": True,
+        })
+
+    return sorted(ut, key=lambda e: e["troughDate"])
 
 
 REPLAY_MILEPAELER = [

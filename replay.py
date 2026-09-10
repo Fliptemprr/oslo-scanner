@@ -174,6 +174,232 @@ def skriv_milepaeler(rader: list) -> None:
               "replay.")
 
 
+SIGNALNAVN = {
+    "A": "fallmomentum avtar", "B": "bunnreaksjon",
+    "C": "kort momentum", "D": "volumstøtte",
+    "higherLow": "higher low", "sma20Reclaim": "SMA20 reclaim",
+}
+
+
+def over_bunn(kurs: float, bunn: float) -> float:
+    return (kurs / bunn - 1) * 100
+
+
+def aktive_navn(r: dict) -> str:
+    return ", ".join(SIGNALNAVN[k] for k, v in (r.get("signaler") or {}).items()
+                     if v) or "ingen"
+
+
+def analyser_episode(rader: list, ep: dict, dager_etter: int = 60) -> dict:
+    """
+    Recoveryfasen etter en registrert bunn, med milepæler og etterpåutvikling.
+
+    Bunnen er funnet på hele serien, altså med etterpåklokskap — den er fasit,
+    ikke input. Modellen som replayes har kun sett data til og med hver enkelt
+    dag.
+    """
+    bunn = ep["troughPrice"]
+    etter = [r for r in rader if str(r["dato"]) >= ep["troughDate"]][:dager_etter + 1]
+    if not etter:
+        return {"episode": ep, "dager": [], "lyttepost": None, "reversal": None,
+                "bottomWatch": None, "falskeStarter": [], "brutt": []}
+
+    def forste(pred):
+        return next((r for r in etter if pred(r)), None)
+
+    lp = forste(lambda r: r["status"] == S.STATUS_LYTTEPOST)
+    bw = forste(lambda r: r["status"] == S.STATUS_BOTTOM_WATCH)
+    # Lagets egen dom, før presedensregelen. STABILIZING vinner over
+    # LYTTEPOST, så laget kan ha sagt LYTTEPOST uten at det ble vist.
+    lp_eget = forste(lambda r: r["tidligStatus"] == S.STATUS_LYTTEPOST)
+    rev = forste(lambda r: r["status"] == S.STATUS_REVERSAL)
+    rev_tek = forste(lambda r: r["reversalTeknisk"])
+    stab = forste(lambda r: r["status"] == S.STATUS_STABILIZING)
+
+    # Falske starter: en LYTTEPOST som senere brytes, eller der bunnen ryker
+    starter, falske = [], []
+    forrige = None
+    for i, r in enumerate(etter):
+        if r["status"] == S.STATUS_LYTTEPOST and forrige != S.STATUS_LYTTEPOST:
+            starter.append((i, r))
+        forrige = r["status"]
+
+    for i, r in starter:
+        senere = etter[i + 1:]
+        brutt = next((x for x in senere
+                      if x["status"] == S.STATUS_LYTTEPOST_BRUTT), None)
+        under_bunn = next((x for x in senere if x["kurs"] < bunn), None)
+        if brutt or under_bunn:
+            falske.append({"signal": r, "brutt": brutt, "underBunn": under_bunn})
+
+    return {
+        "episode": ep, "dager": etter,
+        "bottomWatch": bw, "lyttepost": lp, "lytteposEget": lp_eget,
+        "reversal": rev,
+        "reversalTeknisk": rev_tek, "stabilizing": stab,
+        "starter": [r for _, r in starter], "falskeStarter": falske,
+    }
+
+
+def etterpaa(etter: list, fra: dict, horisonter=(5, 10, 20)) -> str:
+    """Hva skjedde med kursen etter signalet."""
+    if fra is None:
+        return "—"
+    i = next((k for k, r in enumerate(etter) if r["dato"] == fra["dato"]), None)
+    if i is None:
+        return "—"
+    biter = []
+    for h in horisonter:
+        if i + h < len(etter):
+            biter.append(f"+{h}d {over_bunn(etter[i + h]['kurs'], fra['kurs']):+.1f} %")
+    resten = etter[i + 1:]
+    if resten:
+        laveste = min(r["kurs"] for r in resten)
+        biter.append(f"laveste etterpå {laveste:.2f} "
+                     f"({over_bunn(laveste, fra['kurs']):+.1f} %)")
+    return " · ".join(biter) if biter else "—"
+
+
+def skriv_episode(a: dict, dager_etter: int) -> None:
+    ep, etter = a["episode"], a["dager"]
+    bunn = ep["troughPrice"]
+    merke = " (aktiv)" if ep["aktiv"] else ""
+    print("\n" + "-" * 100)
+    print(f"KORREKSJON {ep['peakDate']} → {ep['troughDate']}{merke} · "
+          f"topp {ep['peakPrice']:.2f} → bunn {bunn:.2f} · "
+          f"-{ep['drawdownPct']:.1f} % · {ep['dager']} dager")
+    print("-" * 100)
+    if not etter:
+        print("  Ingen replayede dager etter bunnen.")
+        return
+
+    print(f"\n  {'DATO':12s} {'KURS':>8s} {'% O/BUNN':>9s} {'TURN':>5s} "
+          f"{'ENTRY':>6s} {'SIG':>4s}  {'VIST STATUS':18s} {'LAGET SELV':14s} "
+          f"AKTIVE SIGNALER")
+    forrige = None
+    for r in etter:
+        if r["status"] == forrige and r["status"] not in (
+                S.STATUS_LYTTEPOST, S.STATUS_LYTTEPOST_BRUTT):
+            continue
+        forrige = r["status"]
+        eget = S.STATUS_TEKST.get(r["tidligStatus"], "—")
+        print(f"  {str(r['dato']):12s} {r['kurs']:8.2f} "
+              f"{over_bunn(r['kurs'], bunn):8.1f} % {r['turnScore']:5d} "
+              f"{r['entryValue']:6d} {r['antallSignaler']:4d}  "
+              f"{S.STATUS_TEKST.get(r['status'], r['status']):18s} "
+              f"{eget:14s} {aktive_navn(r)}")
+
+    print("\n  MILEPÆLER FRA BUNN "
+          f"{ep['troughDate']} ({bunn:.2f}):")
+    for navn, r in (("BOTTOM WATCH", a["bottomWatch"]),
+                    ("LYTTEPOST vist", a["lyttepost"]),
+                    ("LYTTEPOST laget", a["lytteposEget"]),
+                    ("STABILIZING", a["stabilizing"]),
+                    ("REVERSAL", a["reversal"]),
+                    ("REVERSAL teknisk", a["reversalTeknisk"])):
+        if r is None:
+            print(f"    {navn:18s} — inntraff ikke")
+            continue
+        dager = next(k for k, x in enumerate(etter) if x["dato"] == r["dato"])
+        print(f"    {navn:18s} {r['dato']} · {r['kurs']:8.2f} · "
+              f"{over_bunn(r['kurs'], bunn):+6.1f} % over bunn · "
+              f"{dager:2d} handelsdager etter bunn · Turn {r['turnScore']} · "
+              f"Entry {r['entryValue']}")
+        if navn.startswith("LYTTEPOST"):
+            print(f"    {'':18s} aktive signaler: {aktive_navn(r)}")
+
+    lp = a["lyttepost"] or a["lytteposEget"]
+    rt = a["reversalTeknisk"]
+    if lp and rt:
+        d_lp, d_rt = over_bunn(lp["kurs"], bunn), over_bunn(rt["kurs"], bunn)
+        i_lp = next(k for k, x in enumerate(etter) if x["dato"] == lp["dato"])
+        i_rt = next(k for k, x in enumerate(etter) if x["dato"] == rt["dato"])
+        print(f"\n    FORSPRANG: LYTTEPOST {d_lp:+.1f} % over bunn mot "
+              f"REVERSAL {d_rt:+.1f} % → {d_rt - d_lp:+.1f} prosentpoeng "
+              f"billigere, {i_rt - i_lp} handelsdager tidligere")
+
+    print(f"\n  ETTERPÅ:")
+    print(f"    etter LYTTEPOST   {etterpaa(etter, lp)}")
+    print(f"    etter REVERSAL    {etterpaa(etter, rt)}")
+
+    if a["falskeStarter"]:
+        print(f"\n  FALSKE STARTER: {len(a['falskeStarter'])} av "
+              f"{len(a['starter'])} LYTTEPOST-signaler")
+        for f in a["falskeStarter"]:
+            grunn = ("brutt " + str(f["brutt"]["dato"]) if f["brutt"]
+                     else "kurs under bunn " + str(f["underBunn"]["dato"]))
+            print(f"    {f['signal']['dato']} · {f['signal']['kurs']:.2f} "
+                  f"({over_bunn(f['signal']['kurs'], bunn):+.1f} %) → {grunn}")
+    elif a["starter"]:
+        print(f"\n  FALSKE STARTER: ingen av {len(a['starter'])} "
+              f"LYTTEPOST-signaler feilet")
+
+
+def kjor_korreksjoner(t: str, df, dager: int, dager_etter: int,
+                      min_dybde: float) -> None:
+    episoder = [e for e in S.korreksjonsepisoder(t, df)
+                if e["drawdownPct"] >= min_dybde]
+    if not episoder:
+        print(f"  Ingen registrerte korreksjoner dypere enn {min_dybde} %.")
+        return
+
+    rader = S.replay_ticker(t, df, dager)
+    if not rader:
+        print("  For kort historikk til replay.")
+        return
+    forste_replay = str(rader[0]["dato"])
+    brukbare = [e for e in episoder if e["troughDate"] >= forste_replay]
+    print(f"  {len(episoder)} registrerte korreksjoner, {len(brukbare)} med "
+          f"bunn innenfor replayvinduet ({forste_replay} →).")
+
+    analyser = [analyser_episode(rader, e, dager_etter) for e in brukbare]
+    for a in analyser:
+        skriv_episode(a, dager_etter)
+
+    print("\n" + "=" * 100)
+    print(f"OPPSUMMERING {t}")
+    print("=" * 100)
+    med_lp = [a for a in analyser if a["lyttepost"] or a["lytteposEget"]]
+    vist_lp = [a for a in analyser if a["lyttepost"]]
+    med_rt = [a for a in analyser if a["reversalTeknisk"]]
+    begge = [a for a in analyser
+             if (a["lyttepost"] or a["lytteposEget"]) and a["reversalTeknisk"]]
+
+    def snitt(xs):
+        return sum(xs) / len(xs) if xs else None
+
+    lp_pct = [over_bunn((a["lyttepost"] or a["lytteposEget"])["kurs"],
+                        a["episode"]["troughPrice"]) for a in med_lp]
+    rt_pct = [over_bunn(a["reversalTeknisk"]["kurs"], a["episode"]["troughPrice"])
+              for a in med_rt]
+    diff = [over_bunn(a["reversalTeknisk"]["kurs"], a["episode"]["troughPrice"])
+            - over_bunn((a["lyttepost"] or a["lytteposEget"])["kurs"],
+                        a["episode"]["troughPrice"])
+            for a in begge]
+    falske = sum(len(a["falskeStarter"]) for a in analyser)
+    starter = sum(len(a["starter"]) for a in analyser)
+
+    print(f"  Korreksjoner analysert          {len(analyser)}")
+    print(f"  LYTTEPOST etter lagets kriterier {len(med_lp)}/{len(analyser)}")
+    print(f"  ...og faktisk VIST som status    {len(vist_lp)}/{len(analyser)}"
+          + ("   ← STABILIZING vant presedensen" if len(vist_lp) < len(med_lp)
+             else ""))
+    print(f"  REVERSAL (teknisk) utløst i     {len(med_rt)}/{len(analyser)}")
+    if lp_pct:
+        print(f"  Snitt LYTTEPOST over bunn       {snitt(lp_pct):+.1f} %")
+    if rt_pct:
+        print(f"  Snitt REVERSAL over bunn        {snitt(rt_pct):+.1f} %")
+    if diff:
+        print(f"  Snitt forsprang                 {snitt(diff):+.1f} "
+              f"prosentpoeng billigere ({len(diff)} korreksjoner)")
+    if starter:
+        print(f"  Falske starter                  {falske}/{starter} "
+              f"LYTTEPOST-signaler ({falske / starter * 100:.0f} %)")
+    print("\n  REVERSAL krever manuell fundamental godkjenning, som ikke finnes")
+    print("  i historikk. «REVERSAL teknisk» er derfor sammenligningspunktet:")
+    print("  alle tekniske krav oppfylt, kun gaten manglet.")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Historisk replay av Early Entry")
     ap.add_argument("--tickere", nargs="+", default=STANDARD)
@@ -183,6 +409,12 @@ def main() -> int:
                     help="vis hver dag, ikke bare statusendringer")
     ap.add_argument("--csv", metavar="PREFIKS",
                     help="skriv full tabell til PREFIKS_<ticker>.csv")
+    ap.add_argument("--korreksjoner", action="store_true",
+                    help="analyser hver registrerte korreksjon for seg")
+    ap.add_argument("--etter", type=int, default=60,
+                    help="handelsdager med recovery som analyseres etter bunnen")
+    ap.add_argument("--min-dybde", type=float, default=10.0,
+                    help="minste drawdown i prosent for å tas med")
     a = ap.parse_args()
 
     pd.set_option("display.width", 200)
@@ -202,6 +434,10 @@ def main() -> int:
         print(f"{t} · replay av {a.dager} handelsdager · "
               f"kun data t.o.m. hver enkelt dag")
         print("=" * 100)
+
+        if a.korreksjoner:
+            kjor_korreksjoner(t, df, a.dager, a.etter, a.min_dybde)
+            continue
 
         rader = S.replay_ticker(t, df, a.dager)
         if not rader:
