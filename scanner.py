@@ -4700,7 +4700,9 @@ def _kildediagnose(diag: dict, dstatus: dict) -> None:
     if not rader:
         return
 
-    with st.expander("DATAKILDER — DIAGNOSE"):
+    # Åpen av seg selv når noe er galt, ellers sammenslått
+    with st.expander("DATAKILDER — DIAGNOSE",
+                     expanded=bool(dstatus["stale"] or dstatus.get("spriker"))):
         st.caption(
             f"Forventet siste avsluttede handelsdag: {dstatus['forventet']} · "
             f"HTTP-klient: {diag.get('_sesjon', '?')}. "
@@ -4929,8 +4931,10 @@ def main() -> None:
                     st.html(kort_html(r, sone["form"]))
 
         st.html(f'<div style="height:1px;background:{DC["linje"]};margin:18px 0 8px;"></div>')
-        if dstatus["stale"]:
-            _kildediagnose(kildediag, dstatus)
+        # Vises alltid. Diagnosen trengs nettopp når alt SER riktig ut og
+        # datagrunnlaget skal verifiseres — ikke bare når det allerede er
+        # flagget som foreldet.
+        _kildediagnose(kildediag, dstatus)
         _fotnote()
 
     with panel:
