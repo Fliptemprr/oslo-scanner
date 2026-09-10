@@ -15,6 +15,7 @@ Krever nett. Rører verken scoring, terskler eller statuslogikk.
 """
 
 import argparse
+import copy
 import sys
 from datetime import datetime, timedelta
 
@@ -400,6 +401,135 @@ def kjor_korreksjoner(t: str, df, dager: int, dager_etter: int,
     print("  alle tekniske krav oppfylt, kun gaten manglet.")
 
 
+VARIANTER = [
+    ("dagens", {}),
+    ("presedens", {"lyttepostForanStabilizing": True}),
+    ("entry-decay", {"decayKreverEntry": True}),
+    ("begge", {"lyttepostForanStabilizing": True, "decayKreverEntry": True}),
+]
+
+
+def variant_cfg(overstyr: dict) -> dict:
+    cfg = copy.deepcopy(S.SCANNER_CONFIG)
+    cfg["early"].update(overstyr)
+    return cfg
+
+
+def lp_starter(etter: list) -> list:
+    """Hver gang LYTTEPOST slås PÅ, ikke hver dag den står på."""
+    ut, forrige = [], None
+    for r in etter:
+        if r["status"] == S.STATUS_LYTTEPOST and forrige != S.STATUS_LYTTEPOST:
+            ut.append(r)
+        forrige = r["status"]
+    return ut
+
+
+def maal_variant(t: str, df, episoder: list, dager: int, dager_etter: int,
+                 cfg: dict) -> dict:
+    """Kjør replay med en gitt config og mål det vi bryr oss om."""
+    rader = S.replay_ticker(t, df, dager, cfg=cfg)
+    per_episode = []
+    for ep in episoder:
+        a = analyser_episode(rader, ep, dager_etter)
+        etter = a["dager"]
+        starter = lp_starter(etter)
+        forste = starter[0] if starter else None
+        dag_nr = (next(k for k, x in enumerate(etter) if x["dato"] == forste["dato"])
+                  if forste else None)
+        per_episode.append({
+            "ep": ep, "etter": etter, "starter": starter, "forste": forste,
+            "dagNr": dag_nr,
+            "overBunn": (over_bunn(forste["kurs"], ep["troughPrice"])
+                         if forste else None),
+            "falske": a["falskeStarter"],
+            "lpDager": sum(1 for r in etter if r["status"] == S.STATUS_LYTTEPOST),
+        })
+    return {"rader": rader, "episoder": per_episode}
+
+
+def sammenlign(t: str, df, dager: int, dager_etter: int,
+               min_dybde: float) -> None:
+    episoder = [e for e in S.korreksjonsepisoder(t, df)
+                if e["drawdownPct"] >= min_dybde]
+    prov = S.replay_ticker(t, df, dager)
+    if not prov or not episoder:
+        print("  For lite data til sammenligning.")
+        return
+    forste_replay = str(prov[0]["dato"])
+    episoder = [e for e in episoder if e["troughDate"] >= forste_replay]
+    print(f"  {len(episoder)} korreksjoner med bunn innenfor replayvinduet.\n")
+
+    kjort = {}
+    for navn, overstyr in VARIANTER:
+        kjort[navn] = maal_variant(t, df, episoder, dager, dager_etter,
+                                   variant_cfg(overstyr))
+
+    # ── Per korreksjon ──
+    for i, ep in enumerate(episoder):
+        print("-" * 100)
+        print(f"KORREKSJON {ep['peakDate']} → {ep['troughDate']} · "
+              f"bunn {ep['troughPrice']:.2f} · -{ep['drawdownPct']:.1f} %")
+        print(f"  {'VARIANT':13s} {'SIGNALER':>9s} {'FØRSTE LP':>26s} "
+              f"{'LP-DAGER':>9s} {'FALSKE':>7s}")
+        for navn, _ in VARIANTER:
+            e = kjort[navn]["episoder"][i]
+            forste = (f"{e['forste']['dato']} {e['forste']['kurs']:7.2f} "
+                      f"{e['overBunn']:+5.1f} % d{e['dagNr']}"
+                      if e["forste"] else "—")
+            print(f"  {navn:13s} {len(e['starter']):9d} {forste:>26s} "
+                  f"{e['lpDager']:9d} {len(e['falske']):7d}")
+        print()
+
+    # ── Totalt ──
+    print("=" * 100)
+    print(f"OPPSUMMERING {t}")
+    print("=" * 100)
+    print(f"  {'VARIANT':13s} {'SIGNALER':>9s} {'KORR MED LP':>12s} "
+          f"{'SNITT % O/BUNN':>15s} {'SNITT DAG':>10s} {'LP-DAGER':>9s} "
+          f"{'FALSKE':>7s}")
+    for navn, _ in VARIANTER:
+        eps = kjort[navn]["episoder"]
+        starter = sum(len(e["starter"]) for e in eps)
+        med = [e for e in eps if e["forste"]]
+        falske = sum(len(e["falske"]) for e in eps)
+        lpdager = sum(e["lpDager"] for e in eps)
+        snitt_pct = (sum(e["overBunn"] for e in med) / len(med)) if med else None
+        snitt_dag = (sum(e["dagNr"] for e in med) / len(med)) if med else None
+        print(f"  {navn:13s} {starter:9d} {len(med):>7d}/{len(eps):<4d} "
+              f"{(f'{snitt_pct:+.1f} %' if med else '—'):>15s} "
+              f"{(f'{snitt_dag:.1f}' if med else '—'):>10s} "
+              f"{lpdager:9d} {falske:7d}")
+
+    # ── Hvilke signaler forsvinner med entry-decay, og var de gode? ──
+    for grunnlag, variant in (("dagens", "entry-decay"),
+                              ("presedens", "begge")):
+        print(f"\n  ENTRY-DECAY MOT «{grunnlag}»: hvilke signaler forsvinner?")
+        forsvunnet, beholdt = [], 0
+        for i, ep in enumerate(episoder):
+            basis = kjort[grunnlag]["episoder"][i]
+            ny = kjort[variant]["episoder"][i]
+            ny_datoer = {r["dato"] for r in ny["starter"]}
+            falske_datoer = {f["signal"]["dato"] for f in basis["falske"]}
+            for r in basis["starter"]:
+                if r["dato"] in ny_datoer:
+                    beholdt += 1
+                else:
+                    forsvunnet.append((ep, r, r["dato"] in falske_datoer))
+        if not forsvunnet:
+            print(f"    Ingen. Alle {beholdt} signaler beholdt.")
+            continue
+        daarlige = sum(1 for _, _, falsk in forsvunnet if falsk)
+        print(f"    {len(forsvunnet)} forsvant, {beholdt} beholdt.")
+        for ep, r, falsk in forsvunnet:
+            print(f"      {r['dato']} · {r['kurs']:7.2f} · "
+                  f"{over_bunn(r['kurs'], ep['troughPrice']):+6.1f} % over bunn · "
+                  f"Turn {r['turnScore']} · Entry {r['entryValue']} · "
+                  f"{'VAR falsk start' if falsk else 'var IKKE falsk start'}")
+        print(f"    → {daarlige} av {len(forsvunnet)} fjernede var falske "
+              f"starter. {len(forsvunnet) - daarlige} var det ikke.")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Historisk replay av Early Entry")
     ap.add_argument("--tickere", nargs="+", default=STANDARD)
@@ -415,6 +545,9 @@ def main() -> int:
                     help="handelsdager med recovery som analyseres etter bunnen")
     ap.add_argument("--min-dybde", type=float, default=10.0,
                     help="minste drawdown i prosent for å tas med")
+    ap.add_argument("--varianter", action="store_true",
+                    help="sammenlign dagens modell mot presedens- og "
+                         "entry-decay-variantene")
     a = ap.parse_args()
 
     pd.set_option("display.width", 200)
@@ -434,6 +567,10 @@ def main() -> int:
         print(f"{t} · replay av {a.dager} handelsdager · "
               f"kun data t.o.m. hver enkelt dag")
         print("=" * 100)
+
+        if a.varianter:
+            sammenlign(t, df, a.dager, a.etter, a.min_dybde)
+            continue
 
         if a.korreksjoner:
             kjor_korreksjoner(t, df, a.dager, a.etter, a.min_dybde)

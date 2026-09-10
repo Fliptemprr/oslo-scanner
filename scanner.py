@@ -324,6 +324,20 @@ SCANNER_CONFIG: dict[str, Any] = {
         # §10 rangering
         "opportunityTurnVekt": 0.6,
         "opportunityEntryVekt": 0.4,
+
+        # ── Varianter under testing. Begge AV, altså dagens oppførsel. ──
+        # Skrus på i replay.py for å måle effekten før en eventuell
+        # regelendring. Live-modellen er uendret så lenge de står False.
+        #
+        # LYTTEPOST vises i dag kun når den klassiske statusen ikke allerede
+        # er STABILIZING. Replayet viste at STABILIZING treffer nøyaktig
+        # samme dag i de fleste korreksjoner, så LYTTEPOST ble systematisk
+        # usynlig i akkurat de situasjonene laget er laget for.
+        "lyttepostForanStabilizing": False,
+        # §7 decay sjekker kun Turn Score. Et signal aktivert nær bunnen
+        # lever derfor videre etter at kursen har løpt fra inngangen — KIT
+        # sto med LYTTEPOST på Entry 20, altså 25 % over bunn.
+        "decayKreverEntry": False,
     },
 
     # ── Corporate actions ──
@@ -1950,8 +1964,12 @@ def vurder_tidlig_lag(ind: dict, cc: Optional["CorrectionEvent"],
         # §7: signalet beholdes ned til decay-terskelen, ikke bare så lenge
         # aktiveringskravet er oppfylt. Uten hysterese ville et signal blinke
         # av og på rundt 55.
-        status = (STATUS_LYTTEPOST if turn >= e["lyttepostDecay"]
-                  else STATUS_BOTTOM_WATCH)
+        beholdes = turn >= e["lyttepostDecay"]
+        if e.get("decayKreverEntry"):
+            # Variant: inngangen må fortsatt være attraktiv. Uten dette
+            # overlever signalet at kursen løper fra inngangsområdet.
+            beholdes = beholdes and entry >= e["entryMin"]
+        status = STATUS_LYTTEPOST if beholdes else STATUS_BOTTOM_WATCH
     elif kniv:
         # §2/§5: ingen LYTTEPOST, og BOTTOM WATCH krever falling_knife = FALSE
         status = None
@@ -2009,8 +2027,13 @@ def classify_status(r: dict, cfg: dict = SCANNER_CONFIG) -> str:
     # PCTL-kolonnene, så ingenting går tapt ved at LYTTEPOST vises i stedet
     # for CORRECTION.
     tidlig = (r.get("early") or {}).get("status")
-    if tidlig and klassisk not in (STATUS_EVENT_RISK, STATUS_STABILIZING,
-                                   STATUS_REVERSAL):
+    blokkerer = [STATUS_EVENT_RISK, STATUS_STABILIZING, STATUS_REVERSAL]
+    if (cfg["early"].get("lyttepostForanStabilizing")
+            and tidlig == STATUS_LYTTEPOST):
+        # Variant: LYTTEPOST slår STABILIZING når kriteriene er oppfylt.
+        # EVENT RISK og REVERSAL vinner fortsatt.
+        blokkerer.remove(STATUS_STABILIZING)
+    if tidlig and klassisk not in blokkerer:
         return tidlig
     return klassisk
 
@@ -3467,7 +3490,15 @@ def korreksjonsepisoder(ticker: str, df: pd.DataFrame,
             "aktiv": True,
         })
 
-    return sorted(ut, key=lambda e: e["troughDate"])
+    # Den aktive korreksjonen kan også være funnet som avsluttet av
+    # swing-motoren. Samme topp og bunn skal ikke telles to ganger; den
+    # aktive vinner, siden den bærer den ferskeste tilstanden.
+    unik = {}
+    for e in ut:
+        nokkel = (e["peakDate"], e["troughDate"])
+        if nokkel not in unik or e["aktiv"]:
+            unik[nokkel] = e
+    return sorted(unik.values(), key=lambda e: e["troughDate"])
 
 
 REPLAY_MILEPAELER = [

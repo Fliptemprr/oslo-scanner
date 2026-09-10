@@ -1024,12 +1024,12 @@ krav("§8", "LYTTEPOST BRUTT står minst én handelsdag, så slipper den taket",
      f"brukeren skal rekke å se at den tidlige hypotesen feilet")
 
 # ── §1: dagens statuser skal stå urørt ──
-def status_med_tidlig(fase, sev, tidlig_status, **over):
+def status_med_tidlig(fase, sev, tidlig_status, cfg=None, **over):
     r = {"phase": fase, "severity": sev, "recoveryScore": 80, "trendScore": 70,
          "fundamentalsChecked": True, "thesisIntact": True, "eventRisk": False,
          "early": {"status": tidlig_status}}
     r.update(over)
-    return S.classify_status(r)
+    return S.classify_status(r, cfg or S.SCANNER_CONFIG)
 
 
 krav("§T10", "LYTTEPOST viker for STABILIZING, REVERSAL og EVENT RISK",
@@ -1231,6 +1231,55 @@ krav("§E1", "Korreksjonsepisoder gir topp, bunn og dybde som henger sammen",
      f"kursene slås opp i serien, og dybden stemmer med topp og bunn\n    "
      f"nøyaktig én episode er merket aktiv: "
      f"{aktive[0]['peakDate']} → {aktive[0]['troughDate']}")
+
+
+# ── Varianter under testing, begge AV i standardoppsettet ──
+
+krav("§V0", "Variantflaggene er av i live-modellen",
+     S.SCANNER_CONFIG["early"]["lyttepostForanStabilizing"] is False
+     and S.SCANNER_CONFIG["early"]["decayKreverEntry"] is False,
+     "replay.py skrur dem på i en egen config; SCANNER_CONFIG er uendret")
+
+CFG_PRESEDENS = copy.deepcopy(S.SCANNER_CONFIG)
+CFG_PRESEDENS["early"]["lyttepostForanStabilizing"] = True
+
+krav("§V1", "Variant presedens: LYTTEPOST slår STABILIZING, men ikke REVERSAL",
+     status_med_tidlig(S.PHASE_BASE_BUILDING, S.SEV_STRONG, S.STATUS_LYTTEPOST,
+                       cfg=CFG_PRESEDENS) == S.STATUS_LYTTEPOST
+     and status_med_tidlig(S.PHASE_RECOVERING, S.SEV_STRONG, S.STATUS_LYTTEPOST,
+                           cfg=CFG_PRESEDENS) == S.STATUS_REVERSAL
+     and status_med_tidlig(S.PHASE_EVENT_RISK, S.SEV_STRONG, S.STATUS_LYTTEPOST,
+                           cfg=CFG_PRESEDENS) == S.STATUS_EVENT_RISK
+     and status_med_tidlig(S.PHASE_BASE_BUILDING, S.SEV_STRONG,
+                           S.STATUS_BOTTOM_WATCH, cfg=CFG_PRESEDENS)
+     == S.STATUS_STABILIZING
+     and status_med_tidlig(S.PHASE_BASE_BUILDING, S.SEV_STRONG,
+                           S.STATUS_LYTTEPOST) == S.STATUS_STABILIZING,
+     "med flagget: LYTTEPOST vises i stedet for STABILIZING\n    "
+     "BOTTOM WATCH slår fortsatt ikke STABILIZING — kun LYTTEPOST\n    "
+     "uten flagget er oppførselen nøyaktig som før")
+
+CFG_ENTRY = copy.deepcopy(S.SCANNER_CONFIG)
+CFG_ENTRY["early"]["decayKreverEntry"] = True
+
+# Turn 50 holder signalet i live i dag. Med Entry i decay skal et signal som
+# har løpt fra inngangen falle tilbake til BOTTOM WATCH.
+langt_unna = dict(svakere, distanceFromLowPct=25.0)
+v_dagens = tidlig_med(langt_unna, lagret=signal)
+v_entry = tidlig_med(langt_unna, lagret=signal, cfg=CFG_ENTRY)
+naer = tidlig_med(svakere, lagret=signal, cfg=CFG_ENTRY)
+
+krav("§V2", "Variant entry-decay: signal som løper fra inngangen svekkes",
+     v_dagens["status"] == S.STATUS_LYTTEPOST
+     and v_dagens["entryValue"] < S.SCANNER_CONFIG["early"]["entryMin"]
+     and v_entry["status"] == S.STATUS_BOTTOM_WATCH
+     and naer["status"] == S.STATUS_LYTTEPOST,
+     f"Turn {v_dagens['turnScore']} · Entry {v_dagens['entryValue']} "
+     f"(25 % over bunn)\n    "
+     f"dagens regel  → {v_dagens['status']}, fordi kun Turn sjekkes\n    "
+     f"med Entry i decay → {v_entry['status']}\n    "
+     f"samme Turn, men Entry {naer['entryValue']} nær bunnen → "
+     f"{naer['status']}, altså beholdes gode signaler")
 
 
 # ── A: DNB vs NAS ──
