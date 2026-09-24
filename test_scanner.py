@@ -1282,6 +1282,75 @@ krav("§V2", "Variant entry-decay: signal som løper fra inngangen svekkes",
      f"{naer['status']}, altså beholdes gode signaler")
 
 
+# ── Rad med dato men uten Close (24.09.2026) ──
+# Før børsåpning 24.09 sa headeren «MARKEDSDATA T.O.M. 23.09», mens tabellen
+# viste DATO 22.09 og NOD 184.40 / KIT 98.40 — 22.09-closes. Yahoo leverte
+# 23.09 som en rad med volum, men uten OHLC. Raden overlevde
+# dropna(how="all"), hullsjekken så datoen og kjørte aldri backfill, og
+# headeren talte rader mens motoren kastet raden stille.
+
+MORGEN_2409 = datetime(2026, 9, 24, 8, 0, tzinfo=OSLO)
+D22, D23 = date(2026, 9, 22), date(2026, 9, 23)
+
+fasit_2309 = serie_til(D23, seed=41)
+tom_2309 = fasit_2309.copy()
+for _k in ("Open", "High", "Low", "Close"):
+    tom_2309.loc[pd.Timestamp(D23), _k] = np.nan        # volumet står igjen
+
+forv = S.siste_avsluttede_handelsdag(MORGEN_2409)
+st_tom = S.datastatus({"NOD.OL": tom_2309}, MORGEN_2409)
+r_tom = scan("NOD.OL", tom_2309)
+
+krav("§T24", "Rad uten Close regnes som manglende — header og tabell er enige",
+     forv == D23
+     and S._bar_dato(tom_2309) == D22
+     and S.manglende_handelsdager(tom_2309, forv) == [D23]
+     and st_tom["faktisk"] == D22 and st_tom["stale"] is True
+     and r_tom["dataDato"] == D22
+     and pd.Timestamp(D23) in tom_2309.index
+     and len(S._med_kurs(tom_2309)) == len(tom_2309) - 1,
+     f"23.09-raden finnes i indeksen, men uten Close (volum "
+     f"{int(tom_2309.loc[pd.Timestamp(D23), 'Volume'])})\n    "
+     f"header nå: {st_tom['faktisk']}, stale={st_tom['stale']} — før fiksen: "
+     f"23.09, stale=False\n    "
+     f"tabell: DATO {r_tom['dataDato']}\n    "
+     f"hullsjekken finner {S.manglende_handelsdager(tom_2309, forv)}, så "
+     f"backfillen kjøres")
+
+# Med backfill skal 23.09 rekonstrueres, og den tomme raden erstattes
+_ekte_i3, _ekte_m3 = S._hent_intradag, S._hent_dagsmeta
+S._hent_intradag = lambda t, session, cfg=S.SCANNER_CONFIG: falsk_intradag_svar(
+    fasit_2309, [date(2026, 9, 21), D22, D23])
+FASIT_C23 = float(fasit_2309.loc[pd.Timestamp(D23), "Close"])
+S._hent_dagsmeta = lambda t, session, cfg=S.SCANNER_CONFIG: {
+    "timestamp": [int(datetime(2026, 9, 24, 9, 0, tzinfo=OSLO).timestamp())],
+    "meta": {"exchangeTimezoneName": "Europe/Oslo",
+             "chartPreviousClose": FASIT_C23}}
+try:
+    bf, bf_t = S.backfill_manglende_dager({"NOD.OL": tom_2309.copy()}, forv,
+                                          None, {})
+finally:
+    S._hent_intradag, S._hent_dagsmeta = _ekte_i3, _ekte_m3
+
+bf_renset = S.rens_prisdata(bf, MORGEN_2409)
+st_bf2 = S.datastatus(bf_renset, MORGEN_2409)
+r_bf = scan("NOD.OL", bf_renset["NOD.OL"])
+c23 = float(bf_renset["NOD.OL"].loc[pd.Timestamp(D23), "Close"])
+
+krav("§T25", "Backfillen erstatter den tomme raden, og alt står på 23.09",
+     bf_t == ["NOD.OL"]
+     and st_bf2["faktisk"] == D23 and st_bf2["stale"] is False
+     and r_bf["dataDato"] == D23
+     and abs(c23 - FASIT_C23) < 1e-6
+     and abs(r_bf["ind"]["close_now"] - FASIT_C23) < 1e-6
+     and int(bf_renset["NOD.OL"].index.duplicated().sum()) == 0,
+     f"header {st_bf2['faktisk']}, stale={st_bf2['stale']} · tabell DATO "
+     f"{r_bf['dataDato']} · kurs {r_bf['ind']['close_now']:.2f} "
+     f"(offisiell {FASIT_C23:.2f})\n    "
+     f"ingen duplikatrad for 23.09 — den tomme raden er byttet ut, ikke "
+     f"lagt ved siden av")
+
+
 # ── A: DNB vs NAS ──
 FALL = 7.0
 res = {t: scan(t, paalegg_fall(lag_df(**p), FALL, 18))

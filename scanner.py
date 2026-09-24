@@ -2532,11 +2532,30 @@ def siste_avsluttede_handelsdag(naa: Optional[datetime] = None,
     return forrige_handelsdag(oslo.date())
 
 
+def _med_kurs(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Kun rader med gyldig sluttkurs.
+
+    24.09.2026 leverte Yahoo 23.09 som en rad med volum, men uten OHLC.
+    Raden overlevde dropna(how="all"), og kjeden fikk to definisjoner av
+    siste bar: headeren, STALE-sjekken og hullsjekken talte rader og sa 23.09,
+    mens signalmotoren kastet raden stille og regnet alt på 22.09. En rad uten
+    Close er ikke en handelsdag vi har data for, og skal behandles som manglende.
+    """
+    if df is None or len(df) == 0 or "Close" not in df.columns:
+        return df
+    return df[df["Close"].notna()]
+
+
 def _bar_dato(df: pd.DataFrame) -> Optional[date]:
-    """Datoen på siste bar i en kursserie."""
-    if df is None or len(df) == 0:
+    """
+    Datoen på siste bar MED gyldig sluttkurs — samme definisjon som
+    signalmotoren bruker, slik at header og tabell ikke kan bli uenige.
+    """
+    d = _med_kurs(df)
+    if d is None or len(d) == 0:
         return None
-    return pd.Timestamp(df.index[-1]).date()
+    return pd.Timestamp(d.index[-1]).date()
 
 
 def manglende_handelsdager(df: pd.DataFrame, forventet: date,
@@ -2553,7 +2572,11 @@ def manglende_handelsdager(df: pd.DataFrame, forventet: date,
     """
     if df is None or len(df) == 0:
         return []
-    har = {pd.Timestamp(t).date() for t in df.index}
+    # En dato uten Close er et hull, selv om raden finnes. Ellers kjøres
+    # aldri backfillen som skulle rekonstruert dagen.
+    har = {pd.Timestamp(t).date() for t in _med_kurs(df).index}
+    if not har:
+        return []
     forste = min(har)
     ut, d = [], forventet
     for _ in range(maks):
@@ -2741,7 +2764,7 @@ def _download_batch(batch: list, session, start, end) -> dict:
             for t in batch:
                 try:
                     d = _velg_ticker(raw, t)
-                    d = d.dropna(how="all")
+                    d = _med_kurs(d.dropna(how="all"))
                     if len(d) >= MIN_HISTORY_BARS:
                         result[t] = d
                 except (KeyError, TypeError):
@@ -3075,7 +3098,11 @@ def flett_inn_dagsbar(df: pd.DataFrame, dag: date, bar: dict) -> pd.DataFrame:
         return df
     stempel = pd.Timestamp(dag)
     if stempel in df.index:
-        return df
+        if pd.notna(df.loc[stempel, "Close"]):
+            return df
+        # Raden finnes, men uten kurs. Uten dette ville backfillen meldt
+        # «tettet» uten å ha endret noe.
+        df = df.drop(index=stempel)
     ny = pd.DataFrame([{k: bar.get(k) for k in df.columns}], index=[stempel])
     ut = pd.concat([df, ny]).sort_index()
     ut.attrs = dict(df.attrs)
@@ -3172,7 +3199,7 @@ def _hent_siste_dager(ticker: str, session, dager: int = 10) -> Optional[pd.Data
         return None
     if isinstance(raw.columns, pd.MultiIndex):
         raw.columns = raw.columns.get_level_values(0)
-    return raw.dropna(how="all")
+    return _med_kurs(raw.dropna(how="all"))
 
 
 def topp_opp_siste_dager(alle: dict, forventet: date, session,
@@ -3230,7 +3257,7 @@ def _retry_missing(missing: list, session, start, end) -> dict:
             if raw is not None and not raw.empty:
                 if isinstance(raw.columns, pd.MultiIndex):
                     raw.columns = raw.columns.get_level_values(0)
-                raw = raw.dropna(how="all")
+                raw = _med_kurs(raw.dropna(how="all"))
                 if len(raw) >= MIN_HISTORY_BARS:
                     result[t] = raw
             time.sleep(RETRY_DELAY_PER_TICKER)

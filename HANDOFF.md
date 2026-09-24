@@ -27,7 +27,7 @@ egen historikk av korreksjoner, funnet med ATR-normalisert ZigZag. Et fall på
 | Fil | Innhold |
 |---|---|
 | `scanner.py` | Hele appen, ~3800 linjer. Config → typer → indikatorer → handelskalender → swings → scorer → motor → datahenting → UI |
-| `test_scanner.py` | 67 akseptansetester. Kjøres uten nett, med syntetiske kursserier |
+| `test_scanner.py` | 69 akseptansetester. Kjøres uten nett, med syntetiske kursserier |
 | `sjekk_data.py` | Frittstående diagnose av datakildene. Krever nett |
 | `replay.py` | Historisk replay av det tidlige laget. Krever nett |
 | `.streamlit/config.toml` | Mørkt tema |
@@ -44,7 +44,7 @@ gitignorert. Streamlit Cloud har flyktig disk, så listen faller tilbake til
 1. **Ikke endre trading-logikken** — Correction Score, Trend Score, Recovery
    Score, phase, severity, statusmotoren, event risk — uten at brukeren
    eksplisitt gir nye regler. Masterspesifikasjonen styrer, ikke egne ideer.
-2. **`python test_scanner.py` skal være 67/67 før hver push.** Feiler noe,
+2. **`python test_scanner.py` skal være 69/69 før hver push.** Feiler noe,
    er det enten en reell regresjon eller en dårlig test. Begge må undersøkes,
    ingen av dem ignoreres.
 3. **`python -c "import ast; ast.parse(open('scanner.py').read())"` etter hver
@@ -219,6 +219,28 @@ serien mangle dagen permanent. `kjenteSluttkurser` alene tetter ikke det —
 den gir close, ikke OHLCV. Vurder å skrive rekonstruerte barer til disk, eller
 å bytte til en kilde med ekte EOD-historikk, før det inntreffer.
 
+## 3d. Rad med dato men uten Close — løst 24.09.2026
+
+Før børsåpning 24.09 sa headeren «MARKEDSDATA T.O.M. 23.09», mens tabellen
+viste DATO 22.09 og kurser fra 22.09. Yahoo leverte 23.09 som en rad med
+volum, men uten OHLC.
+
+Kjeden hadde to definisjoner av «siste bar». Header, STALE-sjekk, hullsjekk
+og diagnose brukte `df.index[-1]`, altså siste *rad*. Signalmotoren brukte
+siste rad med gyldig Close. Raden overlevde `dropna(how="all")` fordi
+volumet var fylt ut, hullsjekken så datoen og kjørte aldri backfill, og
+motoren kastet raden stille.
+
+Nå finnes kun én definisjon: `_med_kurs()` fjerner rader uten Close ved
+alle tre innhentingsveier, og `_bar_dato` og `manglende_handelsdager`
+bruker samme regel. `flett_inn_dagsbar` erstatter en tom rad i stedet for å
+gi opp. Feiler rekonstruksjonen, blir resultatet STALE på forrige dag — ikke
+en header som påstår noe tabellen ikke bruker.
+
+Hvorfor Yahoo leverte raden tom er ikke observert, siden raden var reparert
+samme kveld. Mest sannsynlig hadde Yahoo volumet, men ikke
+justeringsgrunnlaget, og `auto_adjust=True` gir da tom OHLC.
+
 ## 4. Datahentingens arkitektur
 
 Kjeden i `hent_prisdata()`:
@@ -377,7 +399,7 @@ eller sett gulvet til `False`.
 git pull
 # endre scanner.py
 python -c "import ast; ast.parse(open('scanner.py').read())"
-python test_scanner.py          # skal være 67/67
+python test_scanner.py          # skal være 69/69
 streamlit run scanner.py        # se på den
 git add -A && git commit -m "..." && git push
 ```
